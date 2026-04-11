@@ -71,6 +71,7 @@ func main() {
 	comboHandler := handlers.NewComboHandler(db)
 	lookupHandler := handlers.NewLookupHandler(db)
 	seedHandler := handlers.NewSeedHandler(db)
+	plannerHandler := handlers.NewPlannerHandler(db, rdb)
 	wsHandler := handlers.NewWSHandler(db, hub, cfg.JWTSecret)
 
 	// Routes
@@ -87,6 +88,15 @@ func main() {
 		// Knowledge Base — public (used by ai-service)
 		api.GET("/knowledge-base/lookup", lookupHandler.Lookup)
 		api.POST("/knowledge-base/seed", seedHandler.BulkSeed)
+
+		// Planner — public (used by ai-service)
+		api.POST("/planner/generate", plannerHandler.Generate)
+
+		// Admin — planner cache management
+		admin := r.Group("/admin")
+		{
+			admin.DELETE("/planner/cache", plannerHandler.FlushCache)
+		}
 
 		// WebSocket — auth via query param ?token=xxx
 		api.GET("/ws/itinerary/:id", wsHandler.HandleWebSocket)

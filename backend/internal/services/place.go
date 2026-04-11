@@ -22,21 +22,26 @@ func NewPlaceService(db *gorm.DB) *PlaceService {
 // ---------- DTOs ----------
 
 type CreatePlaceInput struct {
-	Destination         string              `json:"destination" binding:"required"`
+	Destination         string               `json:"destination" binding:"required"`
 	Category            models.PlaceCategory `json:"category" binding:"required"`
-	Name                string              `json:"name" binding:"required"`
-	NameEN              *string             `json:"name_en"`
-	Address             *string             `json:"address"`
-	Area                *string             `json:"area"`
-	Latitude            *float64            `json:"latitude"`
-	Longitude           *float64            `json:"longitude"`
-	CoverImage          *string             `json:"cover_image"`
-	Rating              *float64            `json:"rating"`
-	Hours               *string             `json:"hours"`
-	RecommendedDuration *int                `json:"recommended_duration"`
-	BasePrice           *int                `json:"base_price"`
-	Metadata            datatypes.JSON      `json:"metadata"`
-	SourceURL           *string             `json:"source_url"`
+	Name                string               `json:"name" binding:"required"`
+	NameEN              *string              `json:"name_en"`
+	Address             *string              `json:"address"`
+	Area                *string              `json:"area"`
+	Latitude            *float64             `json:"latitude"`
+	Longitude           *float64             `json:"longitude"`
+	CoverImage          *string              `json:"cover_image"`
+	Images              []string             `json:"images"`
+	Rating              *float64             `json:"rating"`
+	Hours               *string              `json:"hours"`
+	RecommendedDuration *int                 `json:"recommended_duration"`
+	BasePrice           *int                 `json:"base_price"`
+	Metadata            datatypes.JSON       `json:"metadata"`
+	SourceURL           *string              `json:"source_url"`
+	MustVisit           bool                 `json:"must_visit"`
+	PriorityScore       int                  `json:"priority_score"`
+	BestTimeOfDay       *string              `json:"best_time_of_day"`
+	Tags                []string             `json:"tags"`
 }
 
 type UpdatePlaceInput struct {
@@ -55,6 +60,10 @@ type UpdatePlaceInput struct {
 	BasePrice           *int                 `json:"base_price"`
 	Metadata            *datatypes.JSON      `json:"metadata"`
 	SourceURL           *string              `json:"source_url"`
+	MustVisit           *bool                `json:"must_visit"`
+	PriorityScore       *int                 `json:"priority_score"`
+	BestTimeOfDay       *string              `json:"best_time_of_day"`
+	Tags                []string             `json:"tags"`
 }
 
 func validPlaceCategory(c models.PlaceCategory) bool {
@@ -105,12 +114,17 @@ func (s *PlaceService) Create(input CreatePlaceInput) (*models.Place, error) {
 		Latitude:            input.Latitude,
 		Longitude:           input.Longitude,
 		CoverImage:          input.CoverImage,
+		Images:              models.StringArray(input.Images),
 		Rating:              input.Rating,
 		Hours:               input.Hours,
 		RecommendedDuration: input.RecommendedDuration,
 		BasePrice:           input.BasePrice,
 		Metadata:            input.Metadata,
 		SourceURL:           input.SourceURL,
+		MustVisit:           input.MustVisit,
+		PriorityScore:       input.PriorityScore,
+		BestTimeOfDay:       input.BestTimeOfDay,
+		Tags:                models.StringArray(input.Tags),
 		PriceUpdatedAt:      &now,
 	}
 	if err := s.db.Create(&p).Error; err != nil {
@@ -176,6 +190,18 @@ func (s *PlaceService) Update(id string, input UpdatePlaceInput) (*models.Place,
 	}
 	if input.SourceURL != nil {
 		updates["source_url"] = *input.SourceURL
+	}
+	if input.MustVisit != nil {
+		updates["must_visit"] = *input.MustVisit
+	}
+	if input.PriorityScore != nil {
+		updates["priority_score"] = *input.PriorityScore
+	}
+	if input.BestTimeOfDay != nil {
+		updates["best_time_of_day"] = *input.BestTimeOfDay
+	}
+	if input.Tags != nil {
+		updates["tags"] = models.StringArray(input.Tags)
 	}
 
 	if err := s.db.Model(&p).Updates(updates).Error; err != nil {
