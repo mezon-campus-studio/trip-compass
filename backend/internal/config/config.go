@@ -19,6 +19,9 @@ type Config struct {
 	JWTSecret      string
 	Port           string
 	AllowedOrigins string
+	// LLM planner proxy
+	UseLLMPlanner  bool   // USE_LLM_PLANNER=true → proxy to PlannerAIURL
+	PlannerAIURL   string // PLANNER_AI_URL=http://planner-ai:8090
 }
 
 func Load() *Config {
@@ -38,6 +41,8 @@ func Load() *Config {
 		JWTSecret:      os.Getenv("JWT_SECRET"),
 		Port:           os.Getenv("PORT"),
 		AllowedOrigins: os.Getenv("ALLOWED_ORIGINS"),
+		UseLLMPlanner:  os.Getenv("USE_LLM_PLANNER") == "true",
+		PlannerAIURL:   os.Getenv("PLANNER_AI_URL"),
 	}
 
 	if cfg.JWTSecret == "" {

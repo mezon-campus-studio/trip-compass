@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"tripcompass-backend/internal/models"
@@ -9,6 +10,17 @@ import (
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
+
+// parseHoursToOpenClose extracts open/close time strings from hours like "08:00 - 17:00"
+func parseHoursToOpenClose(hours string) (open, close *string) {
+	re := regexp.MustCompile(`(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})`)
+	m := re.FindStringSubmatch(hours)
+	if len(m) == 3 {
+		o, c := m[1], m[2]
+		return &o, &c
+	}
+	return nil, nil
+}
 
 type SeedService struct {
 	db *gorm.DB
@@ -58,6 +70,11 @@ func (s *SeedService) BulkUpsert(input SeedInput) (*SeedResult, error) {
 				metadata = datatypes.JSON([]byte("{}"))
 			}
 
+			var openTime, closeTime *string
+			if p.Hours != nil {
+				openTime, closeTime = parseHoursToOpenClose(*p.Hours)
+			}
+
 			place := models.Place{
 				Destination:         dest,
 				Category:            category,
@@ -68,12 +85,19 @@ func (s *SeedService) BulkUpsert(input SeedInput) (*SeedResult, error) {
 				Latitude:            p.Latitude,
 				Longitude:           p.Longitude,
 				CoverImage:          p.CoverImage,
+				Images:              models.StringArray(p.Images),
 				Rating:              p.Rating,
 				Hours:               p.Hours,
 				RecommendedDuration: p.RecommendedDuration,
 				BasePrice:           p.BasePrice,
 				Metadata:            metadata,
 				SourceURL:           p.SourceURL,
+				MustVisit:           p.MustVisit,
+				PriorityScore:       p.PriorityScore,
+				BestTimeOfDay:       p.BestTimeOfDay,
+				Tags:                models.StringArray(p.Tags),
+				OpenTime:            openTime,
+				CloseTime:           closeTime,
 				PriceUpdatedAt:      &now,
 			}
 
@@ -92,12 +116,19 @@ func (s *SeedService) BulkUpsert(input SeedInput) (*SeedResult, error) {
 					"latitude":              place.Latitude,
 					"longitude":             place.Longitude,
 					"cover_image":           place.CoverImage,
+					"images":                place.Images,
 					"rating":                place.Rating,
 					"hours":                 place.Hours,
+					"open_time":             place.OpenTime,
+					"close_time":            place.CloseTime,
 					"recommended_duration":  place.RecommendedDuration,
 					"base_price":            place.BasePrice,
 					"metadata":              place.Metadata,
 					"source_url":            place.SourceURL,
+					"must_visit":            place.MustVisit,
+					"priority_score":        place.PriorityScore,
+					"best_time_of_day":      place.BestTimeOfDay,
+					"tags":                  place.Tags,
 					"price_updated_at":      now,
 				}
 				if err := tx.Model(&existing).Updates(updates).Error; err != nil {
