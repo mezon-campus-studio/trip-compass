@@ -12,11 +12,30 @@ const (
 	maxDurationPerDay = 600 // minutes
 )
 
-// SelectAttractions picks places within the attraction budget.
-// Priority: must_visit first, then free, then by (priority_score + preference_score) desc within budget.
-// Returns the selected []SlotPlace (attrSpent is now computed via recalcAttrSpent after scheduling).
-func SelectAttractions(places []models.Place, budgetVND, guestCount int, prefs []string) []SlotPlace {
+// SelectAttractions picks places within the attraction budget, filtered by BudgetConstraints.
+//
+// Priority order:
+//  1. must_visit (always included, even if slightly over budget)
+//  2. free attractions (always included when OnlyFreeAttractions=false)
+//  3. paid attractions sorted by (priority_score + preference_score) desc, within budget cap
+//
+// Constraints from strategy:
+//   - OnlyFreeAttractions: skip all paid places (survival mode)
+//   - MaxAttractionPrice: skip paid places above this per-person ticket price
+//   - AllowFullDayPremium: skip full-day attractions (Bà Nà, Cù Lao Chàm) if false
+func SelectAttractions(
+	places []models.Place,
+	budgetVND, guestCount int,
+	prefs []string,
+	constraints BudgetConstraints,
+) []SlotPlace {
+	// Effective attraction budget for total spend tracking
 	attrBudget := int(float64(budgetVND) * attrBudgetRatio)
+	if constraints.MaxAttractionPrice == 0 && !constraints.OnlyFreeAttractions {
+		// Premium tier: give more room for attractions
+		attrBudget = int(float64(budgetVND) * 0.55)
+	}
+
 	spent := 0
 	selected := []SlotPlace{}
 
@@ -25,9 +44,41 @@ func SelectAttractions(places []models.Place, budgetVND, guestCount int, prefs [
 	paid := []models.Place{}
 
 	for _, p := range places {
+		price := 0
+		if p.BasePrice != nil {
+			price = *p.BasePrice
+		}
+
+		// Determine if this is a full-day premium place
+		isFullDay := isFullDayPlace(p)
+
+		// Skip full-day premium when tier doesn't allow (Budget/Survival), including must-visit.
+		// Full-day premium places like Ba Na Hills (1M/person) are simply unaffordable at these tiers.
+		if isFullDay && !constraints.AllowFullDayPremium {
+			continue
+		}
+
+		// Survival: only free attractions (must-visit override: allow if free)
+		if constraints.OnlyFreeAttractions && price > 0 && !p.MustVisit {
+			continue
+		}
+
+		// Filter by max per-person ticket price.
+		// Must-visit places get a 2x override (e.g. 200k cap → allow up to 400k).
+		// Full-day premium is already excluded above so this only affects normal must-visit.
+		if constraints.MaxAttractionPrice > 0 && price > 0 {
+			cap := constraints.MaxAttractionPrice
+			if p.MustVisit {
+				cap = cap * 2 // small override for must-visit, not unlimited
+			}
+			if price > cap {
+				continue
+			}
+		}
+
 		if p.MustVisit {
 			mustVisit = append(mustVisit, p)
-		} else if p.BasePrice == nil || *p.BasePrice == 0 {
+		} else if price == 0 {
 			free = append(free, p)
 		} else {
 			paid = append(paid, p)
@@ -41,11 +92,10 @@ func SelectAttractions(places []models.Place, budgetVND, guestCount int, prefs [
 		if si != sj {
 			return si > sj
 		}
-		ri := 0.0
+		ri, rj := 0.0, 0.0
 		if paid[i].Rating != nil {
 			ri = *paid[i].Rating
 		}
-		rj := 0.0
 		if paid[j].Rating != nil {
 			rj = *paid[j].Rating
 		}
@@ -60,7 +110,7 @@ func SelectAttractions(places []models.Place, budgetVND, guestCount int, prefs [
 		}
 	}
 
-	// 1. Always add must_visit (even if over budget slightly)
+	// 1. Always add must_visit (even slightly over budget)
 	for _, p := range mustVisit {
 		addPlace(p)
 	}
@@ -70,7 +120,7 @@ func SelectAttractions(places []models.Place, budgetVND, guestCount int, prefs [
 		addPlace(p)
 	}
 
-	// 3. Paid within remaining budget
+	// 3. Paid within remaining attraction budget
 	for _, p := range paid {
 		cost := 0
 		if p.BasePrice != nil {
@@ -84,6 +134,20 @@ func SelectAttractions(places []models.Place, budgetVND, guestCount int, prefs [
 	return selected
 }
 
+// isFullDayPlace returns true if a place is a full-day attraction (≥360 min or metadata flag).
+func isFullDayPlace(p models.Place) bool {
+	if len(p.Metadata) > 0 {
+		metaStr := string(p.Metadata)
+		if strings.Contains(metaStr, `"full_day":true`) || strings.Contains(metaStr, `"full_day": true`) {
+			return true
+		}
+	}
+	if p.RecommendedDuration != nil && *p.RecommendedDuration >= 360 {
+		return true
+	}
+	return false
+}
+
 // toSlotPlace converts a models.Place to a SlotPlace for the planner.
 func toSlotPlace(p models.Place) SlotPlace {
 	sp := SlotPlace{
@@ -92,6 +156,7 @@ func toSlotPlace(p models.Place) SlotPlace {
 		Category:    string(p.Category),
 		IsMustVisit: p.MustVisit,
 		Tags:        []string(p.Tags),
+		IsFullDay:   isFullDayPlace(p),
 	}
 	if p.NameEN != nil {
 		sp.NameEN = *p.NameEN
@@ -124,18 +189,13 @@ func toSlotPlace(p models.Place) SlotPlace {
 	if p.Hours != nil {
 		sp.Hours = *p.Hours
 	}
-
-	// Check metadata for full_day flag
-	// PostgreSQL jsonb serializes with spaces: `"full_day": true`
-	if len(p.Metadata) > 0 {
-		metaStr := string(p.Metadata)
-		sp.IsFullDay = strings.Contains(metaStr, `"full_day":true`) || strings.Contains(metaStr, `"full_day": true`)
+	if p.BestTimeOfDay != nil {
+		sp.BestTimeOfDay = *p.BestTimeOfDay
 	}
-	// Also treat any attraction >= 360 min as a full-day activity
-	if sp.Duration >= 360 {
-		sp.IsFullDay = true
+	if p.PriceUpdatedAt != nil {
+		t := *p.PriceUpdatedAt
+		sp.PriceUpdatedAt = &t
 	}
-
 	return sp
 }
 
@@ -176,7 +236,7 @@ func FoodBudgetVND(totalBudget int) int {
 	return int(float64(totalBudget) * foodBudgetRatio)
 }
 
-// destFoodCostVND maps destination → estimated meal cost per person per meal in VND.
+// destFoodCostVND maps destination → estimated meal cost per person per meal (VND).
 var destFoodCostVND = map[string]int{
 	"hà nội":       65_000,
 	"đà nẵng":      85_000,
@@ -191,7 +251,7 @@ var destFoodCostVND = map[string]int{
 	"vũng tàu":     85_000,
 }
 
-// MealCostVND returns the estimated meal cost per person for a destination.
+// MealCostVND returns the estimated meal cost per person per meal for a destination.
 func MealCostVND(destination string) int {
 	dest := strings.ToLower(strings.TrimSpace(destination))
 	if cost, ok := destFoodCostVND[dest]; ok {

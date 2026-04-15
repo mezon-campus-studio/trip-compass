@@ -71,7 +71,7 @@ func main() {
 	comboHandler := handlers.NewComboHandler(db)
 	lookupHandler := handlers.NewLookupHandler(db)
 	seedHandler := handlers.NewSeedHandler(db)
-	plannerHandler := handlers.NewPlannerHandler(db, rdb)
+	plannerHandler := handlers.NewPlannerHandler(db, rdb, cfg)
 	wsHandler := handlers.NewWSHandler(db, hub, cfg.JWTSecret)
 
 	// Routes

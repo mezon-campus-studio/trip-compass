@@ -222,6 +222,11 @@ func SwapOptimize(assignments map[int][]SlotPlace, dayDuration map[int]int, maxR
 				for i := range pls1 {
 					for j := range pls2 {
 						p1, p2 := pls1[i], pls2[j]
+						// Guard: don't swap evening landmarks away from arrival day (day 1),
+						// or move non-evening places into day 1 displacing evening spots.
+						if (d1 == 1 && isEveningPlace(p1)) || (d2 == 1 && isEveningPlace(p2)) {
+							continue
+						}
 						// Check duration constraints after swap
 						dur1After := dayDuration[d1] - activityDuration(p1) + activityDuration(p2)
 						dur2After := dayDuration[d2] - activityDuration(p2) + activityDuration(p1)

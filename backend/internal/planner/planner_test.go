@@ -83,7 +83,7 @@ func TestBuildStandardDay_EveningActivitySlot(t *testing.T) {
 	places := []SlotPlace{longMorning, afternoon, short}
 	food := []SlotPlace{}
 
-	slots := buildStandardDay(places, food, false)
+	slots := buildStandardDay(places, food, false, TemplateStandard)
 
 	hasEvening := false
 	for _, s := range slots {
@@ -99,7 +99,7 @@ func TestBuildStandardDay_EveningActivitySlot(t *testing.T) {
 
 // P1.6: BuildFoodMap with 0 venues should return NO_FOOD_VENUES violation.
 func TestBuildFoodMap_NoVenuesReturnsWarning(t *testing.T) {
-	foodMap, violations := BuildFoodMap(nil, map[int][]SlotPlace{}, 3, "đà nẵng")
+	foodMap, violations := BuildFoodMap(nil, map[int][]SlotPlace{}, 3, "đà nẵng", "local", 0)
 	if len(foodMap) != 0 {
 		t.Errorf("Expected empty foodMap, got %d entries", len(foodMap))
 	}
@@ -329,7 +329,7 @@ func TestGenerate_Pipeline_NoDB(t *testing.T) {
 	// Build day plans
 	days := make([]DayPlan, 0, 5)
 	for d := 1; d <= 5; d++ {
-		dp := BuildDayPlan(d, 5, assignments[d], nil, "2026-05-01", false, "", "")
+		dp := BuildDayPlan(d, 5, assignments[d], nil, "2026-05-01", false, "", "", TemplateStandard)
 		days = append(days, dp)
 	}
 
@@ -365,7 +365,7 @@ func TestBudgetTrip_FoodRatioAdjusted(t *testing.T) {
 
 // TestNoFoodVenues_GracefulError verifies 0 food venues returns warning, not crash.
 func TestNoFoodVenues_GracefulError(t *testing.T) {
-	foodMap, violations := BuildFoodMap(nil, map[int][]SlotPlace{1: {}, 2: {}, 3: {}}, 3, "test-dest")
+	foodMap, violations := BuildFoodMap(nil, map[int][]SlotPlace{1: {}, 2: {}, 3: {}}, 3, "test-dest", "local", 0)
 	if foodMap == nil {
 		t.Error("BuildFoodMap should return non-nil empty map, not nil")
 	}

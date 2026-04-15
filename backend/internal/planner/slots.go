@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	defaultMorningStart = 8 * 60  // 08:00 in minutes
+	defaultMorningStart = 8 * 60  // 08:00 in minutes (standard template)
 	defaultArrivalStart = 15 * 60 // 15:00 in minutes
 	defaultLastDayStart = 7 * 60  // 07:00 in minutes
 	lunchStartMin       = 11*60 + 30
@@ -36,17 +36,34 @@ func activityDuration(p SlotPlace) int {
 }
 
 // BuildDayPlan constructs a DayPlan for one day with dynamic slot timing.
+// The SlotTemplate controls pacing (start time, max activities per day).
+// foodByMeal maps "breakfast"/"lunch"/"dinner" → venue; nil map means no food venues.
 func BuildDayPlan(
 	dayNum, totalDays int,
 	places []SlotPlace,
-	foodPlaces []SlotPlace,
+	foodByMeal DayFoodMap,
 	startDate string,
 	comboIncludesLunch bool,
 	arrivalTime string,
 	departureTime string,
+	template SlotTemplate,
 ) DayPlan {
 	dayType := determineDayType(dayNum, totalDays, places)
 	date := computeDate(startDate, dayNum-1)
+
+	// Extract ordered food slices per day type so each builder gets exactly what it needs.
+	// standard/full_day: no breakfast slot → [lunch, dinner]
+	// arrival:           no breakfast slot → [dinner]
+	// departure:         has breakfast slot → [breakfast, (morning snack skipped)]
+	mealOrder := mealsForDayType(dayType)
+	var foodPlaces []SlotPlace
+	for _, meal := range mealOrder {
+		if foodByMeal != nil {
+			if venues, ok := foodByMeal[meal]; ok && len(venues) > 0 {
+				foodPlaces = append(foodPlaces, venues[0])
+			}
+		}
+	}
 
 	var slots []TimeSlot
 
@@ -58,7 +75,7 @@ func BuildDayPlan(
 	case "full_day":
 		slots = buildFullDay(places, foodPlaces, comboIncludesLunch)
 	default:
-		slots = buildStandardDay(places, foodPlaces, comboIncludesLunch)
+		slots = buildStandardDay(places, foodPlaces, comboIncludesLunch, template)
 	}
 
 	travelMin := computeTravelMin(slots)
@@ -81,19 +98,71 @@ func BuildDayPlan(
 }
 
 // buildStandardDay builds a full standard day schedule dynamically.
-// Pattern: breakfast? → morning activity → lunch → afternoon activity → buffer → dinner → evening
-func buildStandardDay(places, food []SlotPlace, comboIncludesLunch bool) []TimeSlot {
+// The SlotTemplate controls: morning start time and max activities per day.
+//
+// Relaxed  (09:00, ≤2 activities): leisure pacing, beach/free-time block
+// Standard (08:00, ≤3 activities): balanced, current default
+// Active   (07:00, ≤4 activities): packed, short lunch break
+func buildStandardDay(places, food []SlotPlace, comboIncludesLunch bool, template SlotTemplate) []TimeSlot {
 	slots := []TimeSlot{}
-	cur := defaultMorningStart // start at 08:00
+	cur := template.morningStartMin()
+	maxActivities := template.maxActivitiesPerDay()
+	lunchDur := lunchDurationForTemplate(template)
+
+	// Pre-classify: reserve short evening-suitable places for the post-dinner slot.
+	// A place qualifies if it's ≤60min, open late (Hours=="" or closing ≥21:00),
+	// and BestTimeOfDay is "evening"/"night" or "any"/unset.
+	var eveningCandidate *SlotPlace
+	var mainPlaces []SlotPlace
+	for i := range places {
+		p := places[i]
+		dur := activityDuration(p)
+		closingOK := p.Hours == "" || closingHourMin(p.Hours) >= eveningEndMin
+		isEveningTag := p.BestTimeOfDay == "evening" || p.BestTimeOfDay == "night" || isEveningPlace(p)
+		isMorningTag := p.BestTimeOfDay == "morning"
+		if eveningCandidate == nil && dur <= 60 && closingOK && !isMorningTag && (isEveningTag || dur <= 60) {
+			cp := p
+			eveningCandidate = &cp
+		} else {
+			mainPlaces = append(mainPlaces, p)
+		}
+	}
+	// Only put the evening candidate back if there are NO other places to schedule.
+	if eveningCandidate != nil && len(mainPlaces) == 0 {
+		mainPlaces = append(mainPlaces, *eveningCandidate)
+		eveningCandidate = nil
+	}
+	places = mainPlaces
+
 	foodIdx := 0
+	activityCount := 0
 	placeIdx := 0
 
-	// Morning activity
-	if placeIdx < len(places) {
+	// For relaxed template: reduce afternoon cutoff to 16:30 (more free time)
+	afternoonCutoff := 17*60 + 30
+	if template == TemplateRelaxed {
+		afternoonCutoff = 16 * 60 + 30
+	}
+
+	// ── Morning activities ─────────────────────────────────────────────────────
+	for placeIdx < len(places) && activityCount < maxActivities {
 		p := places[placeIdx]
+
+		// Stop morning block before lunch (leave ~30min buffer before 11:30)
+		if cur >= lunchStartMin-30 {
+			break
+		}
+
 		placeIdx++
+		activityCount++
 		dur := activityDuration(p)
 		end := cur + dur
+
+		// Cap morning activity to not overlap lunch
+		if end > lunchStartMin-30 {
+			end = lunchStartMin - 30
+		}
+
 		slots = append(slots, TimeSlot{
 			Start:    minsToTime(cur),
 			End:      minsToTime(end),
@@ -103,12 +172,12 @@ func buildStandardDay(places, food []SlotPlace, comboIncludesLunch bool) []TimeS
 		cur = end + bufferBetweenMin
 	}
 
-	// Lunch around 11:30–13:00; push if still in activity
+	// ── Lunch ─────────────────────────────────────────────────────────────────
 	lunchStart := lunchStartMin
 	if cur > lunchStart {
 		lunchStart = cur
 	}
-	lunchEnd := lunchStart + 90
+	lunchEnd := lunchStart + lunchDur
 	if comboIncludesLunch {
 		slots = append(slots, TimeSlot{
 			Start:        minsToTime(lunchStart),
@@ -126,19 +195,17 @@ func buildStandardDay(places, food []SlotPlace, comboIncludesLunch bool) []TimeS
 			Place:    &f,
 		})
 	}
-	cur = lunchEnd + 30 // 30-min lunch rest
+	cur = lunchEnd + 30 // post-lunch rest
 
-	// Afternoon activity — only if we still have time before dinner buffer (17:30)
-	afternoonCutoff := 17*60 + 30
-	if placeIdx < len(places) && cur < afternoonCutoff {
-		// P3.2: Add realistic travel buffer between morning and afternoon activity
+	// ── Afternoon activities ───────────────────────────────────────────────────
+	for placeIdx < len(places) && activityCount < maxActivities && cur < afternoonCutoff {
+		// Travel buffer between consecutive activities
 		if placeIdx > 0 {
 			prev := places[placeIdx-1]
 			next := places[placeIdx]
 			if prev.Lat != 0 && next.Lat != 0 {
 				travelMin := EstimateTravelMin(HaversineKm(prev.Lat, prev.Lng, next.Lat, next.Lng))
 				if travelMin > bufferBetweenMin {
-					// Add explicit travel slot
 					slots = append(slots, TimeSlot{
 						Start:    minsToTime(cur),
 						End:      minsToTime(cur + travelMin),
@@ -149,11 +216,16 @@ func buildStandardDay(places, food []SlotPlace, comboIncludesLunch bool) []TimeS
 				}
 			}
 		}
+
+		if cur >= afternoonCutoff {
+			break
+		}
+
 		p := places[placeIdx]
 		placeIdx++
+		activityCount++
 		dur := activityDuration(p)
 		end := cur + dur
-		// Cap at 17:30 to leave room for dinner
 		if end > afternoonCutoff {
 			end = afternoonCutoff
 		}
@@ -166,7 +238,18 @@ func buildStandardDay(places, food []SlotPlace, comboIncludesLunch bool) []TimeS
 		cur = end
 	}
 
-	// Buffer before dinner — only add if we have space
+	// ── Relaxed template: free/beach time block ────────────────────────────────
+	if template == TemplateRelaxed && cur < dinnerStartMin-60 {
+		slots = append(slots, TimeSlot{
+			Start:    minsToTime(cur),
+			End:      minsToTime(dinnerStartMin - 60),
+			SlotType: "free_time",
+			IsBuffer: true,
+		})
+		cur = dinnerStartMin - 60
+	}
+
+	// ── Buffer before dinner ───────────────────────────────────────────────────
 	if cur < dinnerStartMin {
 		slots = append(slots, TimeSlot{
 			Start:    minsToTime(cur),
@@ -176,7 +259,7 @@ func buildStandardDay(places, food []SlotPlace, comboIncludesLunch bool) []TimeS
 		})
 	}
 
-	// Dinner — start at 18:00 or after current time if we ran late
+	// ── Dinner ────────────────────────────────────────────────────────────────
 	dinnerStart := dinnerStartMin
 	if cur > dinnerStartMin {
 		dinnerStart = cur
@@ -193,25 +276,34 @@ func buildStandardDay(places, food []SlotPlace, comboIncludesLunch bool) []TimeS
 		})
 	}
 
-	// Evening — starts after dinner actually ends; add short activity if available
-	eveningActivityEndMax := 21 * 60 // cap at 21:00
-	if placeIdx < len(places) {
+	// ── Evening activity (short ≤60min place after dinner) ────────────────────
+	// Use pre-classified eveningCandidate first; fall back to next unscheduled place.
+	var eveningPlace *SlotPlace
+	if eveningCandidate != nil {
+		eveningPlace = eveningCandidate
+	} else if placeIdx < len(places) {
 		p := places[placeIdx]
 		dur := activityDuration(p)
-		// Only short places (≤60min) suitable for evening and still open
-		closingOK := p.Hours == "" || closingHourMin(p.Hours) >= eveningActivityEndMax
-		if dur <= 60 && closingOK && actualDinnerEnd+dur <= eveningActivityEndMax {
+		closingOK := p.Hours == "" || closingHourMin(p.Hours) >= eveningEndMin
+		if dur <= 60 && closingOK && actualDinnerEnd+dur <= eveningEndMin {
 			placeIdx++
+			eveningPlace = &p
+		}
+	}
+	if eveningPlace != nil {
+		dur := activityDuration(*eveningPlace)
+		if actualDinnerEnd+dur <= eveningEndMin {
 			slots = append(slots, TimeSlot{
 				Start:    minsToTime(actualDinnerEnd),
 				End:      minsToTime(actualDinnerEnd + dur),
 				SlotType: "evening_activity",
-				Place:    &p,
+				Place:    eveningPlace,
 			})
 			actualDinnerEnd += dur
 		}
 	}
-	// Evening free block (if any time left before 21:00)
+
+	// ── Evening free block ─────────────────────────────────────────────────────
 	if actualDinnerEnd < eveningEndMin {
 		slots = append(slots, TimeSlot{
 			Start:    minsToTime(actualDinnerEnd),
@@ -221,6 +313,19 @@ func buildStandardDay(places, food []SlotPlace, comboIncludesLunch bool) []TimeS
 	}
 
 	return slots
+}
+
+// lunchDurationForTemplate returns the lunch slot duration in minutes.
+// Active trips have shorter lunch breaks; food-focused relaxed trips have longer ones.
+func lunchDurationForTemplate(template SlotTemplate) int {
+	switch template {
+	case TemplateActive:
+		return 60 // quick lunch
+	case TemplateRelaxed:
+		return 120 // leisurely lunch
+	default:
+		return 90 // standard
+	}
 }
 
 // buildArrivalDay: check-in → 1 light attraction → dinner.
@@ -235,30 +340,86 @@ func buildArrivalDay(places, food []SlotPlace, comboIncludesLunch bool, arrivalT
 	}
 	foodIdx := 0
 
-	// One afternoon activity (capped at 2h so we finish by 17:30)
-	if len(places) > 0 {
-		p := places[0]
-		dur := activityDuration(p)
-		if dur > 120 {
-			dur = 120 // limit arrival day activity
+	// Split places: afternoon vs evening (Dragon Bridge should be after dinner)
+	var afternoonPlaces []SlotPlace
+	var eveningCandidates []SlotPlace
+	for _, p := range places {
+		if isEveningPlace(p) {
+			eveningCandidates = append(eveningCandidates, p)
+		} else {
+			afternoonPlaces = append(afternoonPlaces, p)
 		}
-		end := cur + dur
-		slots = append(slots, TimeSlot{
-			Start:    minsToTime(cur),
-			End:      minsToTime(end),
-			SlotType: "afternoon_activity",
-			Place:    &p,
-		})
-		cur = end
 	}
 
-	// Buffer
-	slots = append(slots, TimeSlot{
-		Start:    minsToTime(cur),
-		End:      minsToTime(cur + bufferBetweenMin),
-		SlotType: "buffer",
-		IsBuffer: true,
-	})
+	// Early arrival (before 12:00): add lunch + 2 afternoon activities
+	if cur <= 12*60 {
+		lunchEnd := lunchStartMin + 90
+		if comboIncludesLunch {
+			slots = append(slots, TimeSlot{
+				Start:        minsToTime(lunchStartMin),
+				End:          minsToTime(lunchEnd),
+				SlotType:     "lunch",
+				ComboCovered: true,
+			})
+		} else if foodIdx < len(food) {
+			f := food[foodIdx]
+			foodIdx++
+			slots = append(slots, TimeSlot{
+				Start:    minsToTime(lunchStartMin),
+				End:      minsToTime(lunchEnd),
+				SlotType: "lunch",
+				Place:    &f,
+			})
+		}
+		cur = lunchEnd + 30
+
+		// Up to 2 afternoon activities for early arrivals
+		for i := 0; i < 2 && i < len(afternoonPlaces) && cur < 17*60; i++ {
+			p := afternoonPlaces[i]
+			dur := activityDuration(p)
+			if dur > 150 {
+				dur = 150
+			}
+			end := cur + dur
+			if end > 17*60 {
+				end = 17 * 60
+			}
+			slots = append(slots, TimeSlot{
+				Start:    minsToTime(cur),
+				End:      minsToTime(end),
+				SlotType: "afternoon_activity",
+				Place:    &p,
+			})
+			cur = end + bufferBetweenMin
+		}
+	} else {
+		// Standard late arrival: 1 activity capped at 2h
+		if len(afternoonPlaces) > 0 {
+			p := afternoonPlaces[0]
+			dur := activityDuration(p)
+			if dur > 120 {
+				dur = 120
+			}
+			end := cur + dur
+			slots = append(slots, TimeSlot{
+				Start:    minsToTime(cur),
+				End:      minsToTime(end),
+				SlotType: "afternoon_activity",
+				Place:    &p,
+			})
+			cur = end
+		}
+	}
+
+	// Buffer before dinner
+	if cur < dinnerStartMin {
+		slots = append(slots, TimeSlot{
+			Start:    minsToTime(cur),
+			End:      minsToTime(dinnerStartMin),
+			SlotType: "buffer",
+			IsBuffer: true,
+		})
+	}
 
 	// Dinner
 	if foodIdx < len(food) {
@@ -272,23 +433,49 @@ func buildArrivalDay(places, food []SlotPlace, comboIncludesLunch bool, arrivalT
 		})
 	}
 
-	// Evening
-	slots = append(slots, TimeSlot{
-		Start:    minsToTime(dinnerEndMin),
-		End:      minsToTime(eveningEndMin),
-		SlotType: "evening",
-	})
+	// Evening — use pre-classified eveningCandidates (e.g. Dragon Bridge)
+	var eveningPlace *SlotPlace
+	if len(eveningCandidates) > 0 {
+		ep := eveningCandidates[0]
+		eveningPlace = &ep
+	}
+
+	if eveningPlace != nil {
+		dur := activityDuration(*eveningPlace)
+		if dur > 60 {
+			dur = 60
+		}
+		eveningStart := dinnerEndMin // 19:30
+		slots = append(slots, TimeSlot{
+			Start:    minsToTime(eveningStart),
+			End:      minsToTime(eveningStart + dur),
+			SlotType: "evening_activity",
+			Place:    eveningPlace,
+		})
+		slots = append(slots, TimeSlot{
+			Start:    minsToTime(eveningStart + dur),
+			End:      minsToTime(eveningEndMin),
+			SlotType: "evening",
+		})
+	} else {
+		slots = append(slots, TimeSlot{
+			Start:    minsToTime(dinnerEndMin),
+			End:      minsToTime(eveningEndMin),
+			SlotType: "evening",
+		})
+	}
 
 	return slots
 }
 
-// buildDepartureDay: breakfast → 1 light morning activity (if any) → buffer → checkout
+// buildDepartureDay: breakfast → 1 light morning activity (if any) → buffer → checkout.
+// Starts at 07:00 for breakfast; morning activity at 08:00 so it respects typical opening hours.
 func buildDepartureDay(places, food []SlotPlace) []TimeSlot {
 	slots := []TimeSlot{}
-	cur := defaultLastDayStart
+	cur := defaultLastDayStart // 07:00
 	foodIdx := 0
 
-	// Breakfast
+	// Breakfast (07:00–08:00)
 	if foodIdx < len(food) {
 		f := food[foodIdx]
 		foodIdx++
@@ -299,6 +486,9 @@ func buildDepartureDay(places, food []SlotPlace) []TimeSlot {
 			Place:    &f,
 		})
 		cur += 60
+	} else {
+		// No breakfast venue: skip to 08:00 for morning activity
+		cur = 8 * 60
 	}
 
 	// Morning activity (capped at 2.5h so done by ~10:30 at latest from 08:00)
@@ -306,7 +496,7 @@ func buildDepartureDay(places, food []SlotPlace) []TimeSlot {
 		p := places[0]
 		dur := activityDuration(p)
 		if dur > 150 {
-			dur = 150 // limit departure day activity to 2.5h
+			dur = 150
 		}
 		end := cur + dur
 		slots = append(slots, TimeSlot{
@@ -416,6 +606,20 @@ func buildFullDay(places, food []SlotPlace, comboIncludesLunch bool) []TimeSlot 
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
+// mealsForDayType returns the ordered list of meal keys each day builder consumes.
+// This ensures foodPlaces[0] always matches the first meal slot in the builder.
+func mealsForDayType(dayType string) []string {
+	switch dayType {
+	case "departure":
+		return []string{"breakfast"} // departure: breakfast only (morning snack), no lunch/dinner
+	case "arrival":
+		return []string{"dinner"} // arrival: dinner only
+	default:
+		// standard and full_day: lunch + dinner (no breakfast slot in these builders)
+		return []string{"lunch", "dinner"}
+	}
+}
+
 func determineDayType(dayNum, totalDays int, places []SlotPlace) string {
 	if dayNum == 1 {
 		return "arrival"
@@ -512,4 +716,3 @@ func timeToMinsFromStr(s string) int {
 	}
 	return h*60 + m
 }
-

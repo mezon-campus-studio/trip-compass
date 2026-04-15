@@ -90,6 +90,62 @@ END $$;`,
 				return nil
 			},
 		},
+		{
+			// Add destination_neighbors and place_seasons tables for day-trip logic.
+			ID: "202604110005_add_day_trip_tables",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					// destination_neighbors: maps a base destination to a nearby day-trip destination
+					`CREATE TABLE IF NOT EXISTS schema_travel.destination_neighbors (
+						id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+						destination   TEXT NOT NULL,
+						neighbor      TEXT NOT NULL,
+						travel_min_ow INT  NOT NULL,
+						trip_type     VARCHAR(20) NOT NULL DEFAULT 'day_trip',
+						min_trip_days INT NOT NULL DEFAULT 4,
+						notes         TEXT
+					);`,
+					`CREATE INDEX IF NOT EXISTS idx_dn_dest
+						ON schema_travel.destination_neighbors (destination);`,
+
+					// place_seasons: months a place is open (empty row = year-round)
+					`CREATE TABLE IF NOT EXISTS schema_travel.place_seasons (
+						id          UUID      PRIMARY KEY DEFAULT gen_random_uuid(),
+						place_id    UUID      NOT NULL REFERENCES schema_travel.places(id) ON DELETE CASCADE,
+						open_months INTEGER[] NOT NULL,
+						notes       TEXT
+					);`,
+					`CREATE INDEX IF NOT EXISTS idx_ps_place
+						ON schema_travel.place_seasons (place_id);`,
+
+					// Seed: Đà Nẵng neighbors
+					`INSERT INTO schema_travel.destination_neighbors
+						(destination, neighbor, travel_min_ow, trip_type, min_trip_days, notes)
+					VALUES
+						('đà nẵng', 'hội an',    60,  'day_trip',  4, '30km south, scenic coastal road'),
+						('đà nẵng', 'mỹ sơn',    75,  'half_day',  6, 'UNESCO sanctuary 70km southwest'),
+						('đà nẵng', 'cù lao chàm', 120, 'day_trip', 7, 'Boat required, seasonal Mar-Aug'),
+						('đà nẵng', 'huế',       120, 'day_trip',  7, 'Hai Van Pass route 100km north')
+					ON CONFLICT DO NOTHING;`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				sqls := []string{
+					`DROP TABLE IF EXISTS schema_travel.place_seasons;`,
+					`DROP TABLE IF EXISTS schema_travel.destination_neighbors;`,
+				}
+				for _, q := range sqls {
+					_ = tx.Exec(q).Error
+				}
+				return nil
+			},
+		},
 	})
 
 	return m.Migrate()

@@ -1,5 +1,7 @@
 package planner
 
+import "time"
+
 // GenerateRequest is the input for the planner engine.
 type GenerateRequest struct {
 	Destination    string   `json:"destination" binding:"required"`
@@ -8,16 +10,22 @@ type GenerateRequest struct {
 	BudgetVND      int      `json:"budget_vnd" binding:"required"`
 	GuestCount     int      `json:"guest_count"`
 	PreferenceTags []string `json:"preference_tags,omitempty"`  // ["beach","culture","food","adventure","nature","nightlife"]
+	TravelStyle    string   `json:"travel_style,omitempty"`     // "relaxed" | "standard" | "active"
+	TravelMonth    int      `json:"travel_month,omitempty"`     // 1-12; inferred from StartDate if absent
 	ArrivalTime    string   `json:"arrival_time,omitempty"`     // "10:00" default "15:00"
 	DepartureTime  string   `json:"departure_time,omitempty"`   // "18:00" default "10:00"
 }
 
 // GenerateResponse is the full output returned to the caller.
 type GenerateResponse struct {
-	Days        []DayPlan    `json:"days"`
-	BudgetRecap BudgetRecap  `json:"budget_recap"`
-	ComboResult *ComboResult `json:"combo_result,omitempty"`
-	Violations  []Violation  `json:"violations,omitempty"`
+	Days               []DayPlan    `json:"days"`
+	BudgetRecap        BudgetRecap  `json:"budget_recap"`
+	ComboResult        *ComboResult `json:"combo_result,omitempty"`
+	Violations         []Violation  `json:"violations,omitempty"`
+	BudgetTier         string       `json:"budget_tier"`                    // "survival"|"budget"|"standard"|"premium"
+	BudgetWarning      string       `json:"budget_warning,omitempty"`       // user-facing warning for low budget
+	SlotTemplate       string       `json:"slot_template"`                  // "relaxed"|"standard"|"active"
+	PriceStaleWarnings []string     `json:"price_stale_warnings,omitempty"` // places with stale prices
 }
 
 // DayPlan represents one day in the itinerary.
@@ -43,23 +51,25 @@ type TimeSlot struct {
 
 // SlotPlace is a denormalized place embedded in a time slot.
 type SlotPlace struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	NameEN      string   `json:"name_en,omitempty"`
-	Category    string   `json:"category"`
-	Address     string   `json:"address,omitempty"`
-	Area        string   `json:"area,omitempty"`
-	Lat         float64  `json:"lat"`
-	Lng         float64  `json:"lng"`
-	CoverImage  string   `json:"cover_image,omitempty"`
-	Images      []string `json:"images,omitempty"`
-	BasePrice   int      `json:"base_price"`
-	Duration    int      `json:"duration_min"`
-	Hours       string   `json:"hours,omitempty"`
-	IsMustVisit bool     `json:"is_must_visit"`
-	IsFullDay   bool     `json:"is_full_day"`
-	IsFree      bool     `json:"is_free"`
-	Tags        []string `json:"tags,omitempty"`
+	ID             string     `json:"id"`
+	Name           string     `json:"name"`
+	NameEN         string     `json:"name_en,omitempty"`
+	Category       string     `json:"category"`
+	Address        string     `json:"address,omitempty"`
+	Area           string     `json:"area,omitempty"`
+	Lat            float64    `json:"lat"`
+	Lng            float64    `json:"lng"`
+	CoverImage     string     `json:"cover_image,omitempty"`
+	Images         []string   `json:"images,omitempty"`
+	BasePrice      int        `json:"base_price"`
+	Duration       int        `json:"duration_min"`
+	Hours          string     `json:"hours,omitempty"`
+	BestTimeOfDay  string     `json:"best_time_of_day,omitempty"` // "morning"|"afternoon"|"evening"|"any"
+	PriceUpdatedAt *time.Time `json:"price_updated_at,omitempty"` // for stale price detection
+	IsMustVisit    bool       `json:"is_must_visit"`
+	IsFullDay      bool       `json:"is_full_day"`
+	IsFree         bool       `json:"is_free"`
+	Tags           []string   `json:"tags,omitempty"`
 }
 
 // BudgetRecap summarizes spending.
@@ -89,7 +99,7 @@ type ComboResult struct {
 
 // Violation is a scheduling rule violation.
 type Violation struct {
-	Rule     string `json:"rule"`     // FOOD_REPEAT|OUTDOOR_NIGHT|OVER_BUDGET
+	Rule     string `json:"rule"`     // FOOD_REPEAT|OUTDOOR_NIGHT|OVER_BUDGET|STALE_PRICE|CLOSED_HOURS
 	Severity string `json:"severity"` // error|warning
 	Message  string `json:"message"`
 	Day      int    `json:"day,omitempty"`
