@@ -104,7 +104,7 @@ async def node_schedule(state: dict) -> dict:
     }
 
 
-def _fallback_schedule(state: TravelPlanState, retrieved: dict) -> dict:
+def _fallback_schedule(state: dict, retrieved: dict) -> dict:
     """Quick deterministic draft to avoid empty output when LLM is slow."""
     places = list(retrieved.get("places", []))
     food = list(retrieved.get("food", []))

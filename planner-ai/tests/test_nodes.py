@@ -188,6 +188,31 @@ class TestNodeValidate:
         types = [v["type"] for v in result["violations"]]
         assert "CLOSED_HOURS" in types
 
+    def test_slot_end_exceeds_closing_detected(self):
+        """Slot starts inside hours but ends after close → should also fail."""
+        schedule = make_schedule([
+            make_slot("place-1", "Ngũ Hành Sơn", 40_000,
+                      start="16:00", end="19:00"),  # starts OK, ends after 17:30
+        ])
+        state = self._state_with_schedule(schedule)
+        result = node_validate(state)
+        types = [v["type"] for v in result["violations"]]
+        assert "CLOSED_HOURS" in types, (
+            "Slot ending after closing time should trigger CLOSED_HOURS"
+        )
+
+    def test_slot_fully_within_hours_passes(self):
+        """Slot entirely within opening hours must NOT trigger CLOSED_HOURS."""
+        schedule = make_schedule([
+            make_slot("place-1", "Ngũ Hành Sơn", 40_000,
+                      start="09:00", end="11:00"),  # well within 07:00-17:30
+        ])
+        state = self._state_with_schedule(schedule)
+        result = node_validate(state)
+        types = [v["type"] for v in result["violations"]]
+        assert "CLOSED_HOURS" not in types
+
+
     def test_time_overlap_detected(self):
         schedule = make_schedule([
             make_slot("place-1", "Ngũ Hành Sơn", 40_000, "09:00", "11:00"),
@@ -221,6 +246,20 @@ class TestNodeValidate:
 
 # ── Route after validate ───────────────────────────────────────────────────────
 class TestRouteAfterValidate:
+
+    @pytest.fixture(autouse=True)
+    def patch_config(self, monkeypatch):
+        """Inject a minimal config stub so route_after_validate doesn't need dotenv."""
+        import types
+        stub = types.SimpleNamespace(MAX_SCHEDULE_RETRIES=2)
+        import app.nodes.validate as val_mod
+        monkeypatch.setattr(val_mod, "_config_stub", stub, raising=False)
+        # Patch the import inside route_after_validate
+        import sys
+        fake_app = types.ModuleType("app")
+        fake_app.config = stub  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "app", fake_app)
+        monkeypatch.setitem(sys.modules, "app.config", stub)  # type: ignore[arg-type]
 
     def test_routes_to_enrich_when_passed(self):
         state = make_state(validation_passed=True, retry_count=0)

@@ -146,6 +146,26 @@ END $$;`,
 				return nil
 			},
 		},
+		{
+			ID: "202604150006_auth_enhancements",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					`ALTER TABLE schema_travel.users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT false;`,
+					`ALTER TABLE schema_travel.users ADD COLUMN IF NOT EXISTS verify_token VARCHAR(64);`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				_ = tx.Exec(`ALTER TABLE schema_travel.users DROP COLUMN IF EXISTS is_verified;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.users DROP COLUMN IF EXISTS verify_token;`).Error
+				return nil
+			},
+		},
 	})
 
 	return m.Migrate()
