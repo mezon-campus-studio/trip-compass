@@ -10,6 +10,8 @@
 # =========================
 *.md
 !README.md
+!docs/integration/
+!docs/integration/**/*.md
 
 # =========================
 # Environment variables and secrets

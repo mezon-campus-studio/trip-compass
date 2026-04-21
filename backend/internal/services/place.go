@@ -89,16 +89,37 @@ func validPlaceCategory(c models.PlaceCategory) bool {
 
 // ---------- Methods ----------
 
-func (s *PlaceService) List(destination string, category string) ([]models.Place, error) {
-	var list []models.Place
-	q := s.db.Order("destination ASC, name ASC")
+// ListResult wraps paginated results.
+type PlaceListResult struct {
+	Data  []models.Place `json:"data"`
+	Total int64          `json:"total"`
+	Page  int            `json:"page"`
+	Limit int            `json:"limit"`
+}
+
+func (s *PlaceService) List(destination, category string, page, limit int) (*PlaceListResult, error) {
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	offset := (page - 1) * limit
+
+	q := s.db.Model(&models.Place{}).Order("destination ASC, name ASC")
 	if destination != "" {
 		q = q.Where("destination ILIKE ?", "%"+strings.TrimSpace(destination)+"%")
 	}
 	if category != "" {
 		q = q.Where("category = ?", strings.ToUpper(strings.TrimSpace(category)))
 	}
-	return list, q.Find(&list).Error
+
+	var total int64
+	q.Count(&total)
+
+	var list []models.Place
+	err := q.Limit(limit).Offset(offset).Find(&list).Error
+	return &PlaceListResult{Data: list, Total: total, Page: page, Limit: limit}, err
 }
 
 func (s *PlaceService) GetByID(id string) (*models.Place, error) {

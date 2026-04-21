@@ -102,12 +102,14 @@ def node_validate(state: TravelPlanState) -> dict:
             if hours and not breakfast_exempt and "00:00-24:00" not in hours:
                 open_min, close_min = _parse_hours(hours)
                 slot_start = _time_to_mins(start_str)
-                if slot_start < open_min or slot_start >= close_min:
+                slot_end   = _time_to_mins(end_str) if end_str else slot_start
+                if slot_start < open_min or slot_end > close_min:
                     violations.append({
                         "type":    "CLOSED_HOURS",
                         "day":     day_num,
                         "place":   place_name,
-                        "message": f"'{place_name}' mở cửa {hours} nhưng được xếp lúc {start_str}.",
+                        "message": f"'{place_name}' m\u1edf c\u1eeda {hours} nh\u01b0ng "
+                                   f"\u0111\u01b0\u1ee3c x\u1ebfp {start_str}\u2013{end_str}.",
                     })
 
             # ── 3. DUPLICATE_PLACE ─────────────────────────────────────────
