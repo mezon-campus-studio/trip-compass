@@ -11,6 +11,9 @@ Tổng hợp luồng frontend ↔ backend ↔ planner-ai.
 | [04-ITINERARY-COLLAB-FLOW.md](04-ITINERARY-COLLAB-FLOW.md) | CRUD + drag-drop reorder + WebSocket realtime + publish/clone |
 | [05-PLACES-COMBOS-FLOW.md](05-PLACES-COMBOS-FLOW.md) | Khám phá, lưu place, chi tiết, combo → itinerary |
 | [06-FRONTEND-INFRA.md](06-FRONTEND-INFRA.md) | `lib/api.ts`, `useAuth`, `useItineraryWS`, `streamChat`, types, error handling |
+| [TASKS-BACKEND.md](TASKS-BACKEND.md) | Phân việc cho backend dev (Go + planner-ai) — P0→P3 |
+| [TASKS-FRONTEND.md](TASKS-FRONTEND.md) | Phân việc cho frontend dev (Next.js) — P0→P7 + sprint plan |
+| [TASKS-PM.md](TASKS-PM.md) | Phân việc cho PM/owner (credentials, infra, legal, launch) |
 
 ## Khởi động dev
 
