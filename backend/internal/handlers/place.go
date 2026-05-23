@@ -3,6 +3,8 @@ package handlers
 import (
 	"net/http"
 	"strconv"
+	"strings"
+	"tripcompass-backend/internal/pagination"
 	"tripcompass-backend/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -19,14 +21,39 @@ func NewPlaceHandler(db *gorm.DB) *PlaceHandler {
 
 // GET /api/v1/places?destination=nha+trang&category=FOOD&page=1&limit=20
 func (h *PlaceHandler) List(c *gin.Context) {
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
-	result, err := h.svc.List(c.Query("destination"), c.Query("category"), page, limit)
+	page, limit, _ := pagination.Parse(c, 20, 100)
+	minRating, _ := strconv.ParseFloat(c.DefaultQuery("min_rating", "0"), 64)
+	mustVisit := parseOptionalBool(c.Query("must_visit"))
+
+	result, err := h.svc.Search(services.PlaceListFilter{
+		Q:           c.Query("q"),
+		Destination: c.Query("destination"),
+		Category:    c.Query("category"),
+		Area:        c.Query("area"),
+		Tags:        splitCSV(c.Query("tags")),
+		MinRating:   minRating,
+		MinPrice:    parseOptionalInt(c.Query("min_price")),
+		MaxPrice:    parseOptionalInt(c.Query("max_price")),
+		MustVisit:   mustVisit,
+		Sort:        c.Query("sort"),
+		Page:        page,
+		Limit:       limit,
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// GET /api/v1/places/destinations
+func (h *PlaceHandler) Destinations(c *gin.Context) {
+	result, err := h.svc.ListDestinations()
+	if err != nil {
+		respondInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": result})
 }
 
 // GET /api/v1/places/:id
@@ -48,7 +75,7 @@ func (h *PlaceHandler) Create(c *gin.Context) {
 	}
 	p, err := h.svc.Create(input)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		handleServiceError(c, err)
 		return
 	}
 	c.JSON(http.StatusCreated, p)
@@ -76,4 +103,34 @@ func (h *PlaceHandler) Delete(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusNoContent, nil)
+}
+
+func splitCSV(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func parseOptionalInt(raw string) int {
+	n, _ := strconv.Atoi(strings.TrimSpace(raw))
+	return n
+}
+
+func parseOptionalBool(raw string) *bool {
+	if raw == "" {
+		return nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return nil
+	}
+	return &v
 }

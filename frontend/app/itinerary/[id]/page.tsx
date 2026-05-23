@@ -28,6 +28,8 @@ import {
   Copy,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { formatVND } from "@/lib/format"
+import { useAuth } from "@/hooks/use-auth"
 
 const CATEGORY_ICONS: Record<string, React.ReactNode> = {
   FOOD:       <Utensils className="w-3.5 h-3.5" />,
@@ -45,14 +47,13 @@ const CATEGORY_LABELS: Record<string, string> = {
   ACTIVITY:   "Hoạt động",
 }
 
-const nf = new Intl.NumberFormat("vi-VN")
-
 function formatDate(d: string) {
   return new Date(d).toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit", year: "numeric" })
 }
 
 export default function ItineraryDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params)
+  const { user } = useAuth()
   const [itinerary, setItinerary] = useState<Itinerary | null>(null)
   const [loading, setLoading] = useState(true)
   const [selectedDay, setSelectedDay] = useState(1)
@@ -77,6 +78,10 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
   }
 
   const handleShare = () => {
+    if (!itinerary || itinerary.status !== "PUBLISHED") {
+      toast.error("Chỉ có thể chia sẻ lịch trình đã xuất bản")
+      return
+    }
     const url = `${window.location.origin}/itinerary/${id}/public`
     navigator.clipboard.writeText(url)
     toast.success("Đã sao chép link chia sẻ")
@@ -84,7 +89,10 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
 
   const handlePublish = async () => {
     try {
-      const updated = await apiFetch<Itinerary>(`/itineraries/${id}/publish`, { method: "PATCH" })
+      const updated = await apiFetch<Itinerary>(`/itineraries/${id}/publish`, {
+        method: "PATCH",
+        body: { status: "PUBLISHED" },
+      })
       setItinerary(updated)
       toast.success("Đã xuất bản lịch trình!")
     } catch {
@@ -101,6 +109,13 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
   }
 
   if (!itinerary) return null
+
+  // Publish + in-place Edit are owner-only on the backend. Hide the buttons for
+  // non-owners so they don't trigger silent backend rejections; collaborators
+  // who need to edit can deep-link to /edit directly (invitation flow) and
+  // anyone else uses the Clone button to fork the itinerary.
+  const isOwner = !!user && user.id === itinerary.owner_id
+  const canShare = itinerary.status === "PUBLISHED"
 
   const activities: Activity[] = itinerary.activities ?? []
   const days = [...new Set(activities.map((a) => a.day_number))].sort((a, b) => a - b)
@@ -164,34 +179,38 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
               <Meta label="Thời gian" value={`${formatDate(itinerary.start_date)} – ${formatDate(itinerary.end_date)}`} />
               <Meta label="Ngân sách" value={budgetLabel[itinerary.budget_category] ?? itinerary.budget_category} />
               <Meta label="Hoạt động" value={`${activities.length}`} />
-              <Meta label="Tổng chi phí" value={`${nf.format(totalCost)} đ`} />
+              <Meta label="Tổng chi phí" value={formatVND(totalCost)} />
             </div>
 
             <div className="border-t border-[#e8e2d9] p-4 flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-4 text-sm text-[#8b8378]">
-                <span className="flex items-center gap-1"><Eye className="w-4 h-4" />{nf.format(itinerary.view_count)} lượt xem</span>
+                <span className="flex items-center gap-1"><Eye className="w-4 h-4" />{itinerary.view_count.toLocaleString("vi-VN")} lượt xem</span>
                 {itinerary.rating > 0 && (
                   <span className="flex items-center gap-1"><Star className="w-4 h-4 fill-[#d4a853] text-[#d4a853]" />{itinerary.rating.toFixed(1)}</span>
                 )}
               </div>
 
               <div className="flex items-center gap-2">
-                <Button variant="outline" onClick={handleShare} className="h-10 px-3 border-[#e8e2d9] bg-transparent text-[#1a1a1a]">
-                  <Share2 className="w-4 h-4 mr-2" />Chia sẻ
-                </Button>
+                {canShare && (
+                  <Button variant="outline" onClick={handleShare} className="h-10 px-3 border-[#e8e2d9] bg-transparent text-[#1a1a1a]">
+                    <Share2 className="w-4 h-4 mr-2" />Chia sẻ
+                  </Button>
+                )}
                 <Button variant="outline" onClick={handleClone} className="h-10 px-3 border-[#e8e2d9] bg-transparent text-[#1a1a1a]">
                   <Copy className="w-4 h-4 mr-2" />Nhân bản
                 </Button>
-                {itinerary.status === "DRAFT" && (
+                {isOwner && itinerary.status === "DRAFT" && (
                   <Button onClick={handlePublish} className="h-10 bg-[#3d5a3d] hover:bg-[#2d4a2d] text-white">
                     Xuất bản
                   </Button>
                 )}
-                <Button asChild className="h-10 bg-[#1a1a1a] hover:bg-[#3d5a3d] text-white">
-                  <Link href={`/itinerary/${id}/edit`}>
-                    <Edit3 className="w-4 h-4 mr-2" />Chỉnh sửa
-                  </Link>
-                </Button>
+                {isOwner && (
+                  <Button asChild className="h-10 bg-[#1a1a1a] hover:bg-[#3d5a3d] text-white">
+                    <Link href={`/itinerary/${id}/edit`}>
+                      <Edit3 className="w-4 h-4 mr-2" />Chỉnh sửa
+                    </Link>
+                  </Button>
+                )}
               </div>
             </div>
           </div>
@@ -215,9 +234,11 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
           {activities.length === 0 ? (
             <div className="text-center py-16 text-[#6b6b6b]">
               <p className="mb-4">Lịch trình này chưa có hoạt động nào.</p>
-              <Button asChild className="bg-[#3d5a3d] text-white hover:bg-[#2d4a2d]">
-                <Link href={`/itinerary/${id}/edit`}><Edit3 className="w-4 h-4 mr-2" />Thêm hoạt động</Link>
-              </Button>
+              {isOwner && (
+                <Button asChild className="bg-[#3d5a3d] text-white hover:bg-[#2d4a2d]">
+                  <Link href={`/itinerary/${id}/edit`}><Edit3 className="w-4 h-4 mr-2" />Thêm hoạt động</Link>
+                </Button>
+              )}
             </div>
           ) : (
             <div className="flex flex-col lg:flex-row gap-10 lg:gap-14">
@@ -247,7 +268,7 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
                         </span>
                         <div className="text-right">
                           <div className="text-[11px] opacity-70 tabular-nums">{acts.length} hoạt động</div>
-                          <div className="text-xs font-medium tabular-nums mt-0.5">{nf.format(cost)} đ</div>
+                          <div className="text-xs font-medium tabular-nums mt-0.5">{formatVND(cost)}</div>
                         </div>
                       </button>
                     )
@@ -268,7 +289,7 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
                   </div>
                   <div className="text-right">
                     <div className="text-[11px] tracking-[0.2em] uppercase text-[#8b8378]">Chi phí</div>
-                    <div className="text-xl font-semibold text-[#1a1a1a] tabular-nums">{nf.format(dayCost)} đ</div>
+                    <div className="text-xl font-semibold text-[#1a1a1a] tabular-nums">{formatVND(dayCost)}</div>
                   </div>
                 </div>
 
@@ -318,7 +339,7 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
                           )}
                           {activity.estimated_cost > 0 && (
                             <span className="ml-auto text-sm font-semibold text-[#1a1a1a] tabular-nums">
-                              {nf.format(activity.estimated_cost)} đ
+                              {formatVND(activity.estimated_cost)}
                             </span>
                           )}
                         </div>

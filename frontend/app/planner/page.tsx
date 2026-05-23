@@ -17,7 +17,6 @@ import {
   List,
   Calendar,
   Eye,
-  Heart,
   MoreVertical,
   Edit3,
   Trash2,
@@ -37,7 +36,6 @@ import { cn } from "@/lib/utils";
 
 type StatusFilter = "all" | "DRAFT" | "PUBLISHED";
 
-const nf = new Intl.NumberFormat("vi-VN");
 
 function PlannerContent() {
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
@@ -83,7 +81,10 @@ function PlannerContent() {
 
   const handlePublish = async (id: string) => {
     try {
-      const updated = await apiFetch<Itinerary>(`/itineraries/${id}/publish`, { method: "PATCH" });
+      const updated = await apiFetch<Itinerary>(`/itineraries/${id}/publish`, {
+        method: "PATCH",
+        body: { status: "PUBLISHED" },
+      });
       setItineraries((prev) => prev.map((i) => (i.id === id ? updated : i)));
       toast.success("Đã xuất bản lịch trình");
     } catch {
@@ -290,8 +291,8 @@ function PlannerContent() {
                       <h3 className="text-base font-semibold text-[#1a1a1a] mb-2 hover:text-[#3d5a3d] transition-colors line-clamp-2 tracking-tight leading-snug">{it.title}</h3>
                     </Link>
                     <div className="flex items-center gap-4 text-sm text-[#8b8378] mb-4">
-                      <div className="flex items-center gap-1"><Eye className="w-3.5 h-3.5" /><span>{nf.format(it.view_count)}</span></div>
-                      <div className="flex items-center gap-1"><Heart className="w-3.5 h-3.5 text-[#c4785a]" /><span>{it.clone_count}</span></div>
+                      <div className="flex items-center gap-1"><Eye className="w-3.5 h-3.5" /><span>{it.view_count.toLocaleString("vi-VN")}</span></div>
+                      <div className="flex items-center gap-1"><Copy className="w-3.5 h-3.5 text-[#c4785a]" /><span>{it.clone_count}</span></div>
                     </div>
                     <div className="flex items-center gap-2 mt-auto">
                       <Button asChild size="sm" variant="outline" className="flex-1 border-[#e8e2d9] text-[#1a1a1a] hover:bg-[#f5f0e8] hover:border-[#3d5a3d]">
@@ -332,7 +333,7 @@ function PlannerContent() {
                     </Link>
                     <div className="flex items-center gap-4 text-sm text-[#8b8378] mt-1">
                       <span>{getDuration(it)} ngày · {it.destination}</span>
-                      <span className="flex items-center gap-1"><Eye className="w-3.5 h-3.5" />{nf.format(it.view_count)}</span>
+                      <span className="flex items-center gap-1"><Eye className="w-3.5 h-3.5" />{it.view_count.toLocaleString("vi-VN")}</span>
                     </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">

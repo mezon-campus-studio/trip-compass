@@ -17,6 +17,13 @@ func NewActivityService(db *gorm.DB) *ActivityService {
 	return &ActivityService{db: db}
 }
 
+// WithTx returns a copy of the service bound to the given transaction.
+// Used by handlers that wrap a mutation + WS outbox enqueue atomically.
+// The copy is shallow — the underlying gorm.DB pointer is just swapped.
+func (s *ActivityService) WithTx(tx *gorm.DB) *ActivityService {
+	return &ActivityService{db: tx}
+}
+
 type CreateActivityInput struct {
 	ItineraryID   string   `json:"itinerary_id" binding:"required"`
 	PlaceID       *string  `json:"place_id"`
@@ -54,25 +61,20 @@ type ReorderItem struct {
 	OrderIndex int    `json:"order_index" binding:"min=0"`
 }
 
-// isOwnerOfActivity checks the user owns the itinerary that the activity belongs to.
-func (s *ActivityService) isOwnerOfActivity(activityID, ownerID string) (*models.Activity, error) {
+// checkActivityEditAccess loads the activity and verifies the user can edit its itinerary.
+// Allows owner or ACCEPTED collaborator with role=EDITOR.
+func (s *ActivityService) checkActivityEditAccess(activityID, userID string) (*models.Activity, error) {
 	var act models.Activity
 	if err := s.db.First(&act, "id = ?", activityID).Error; err != nil {
 		return nil, apperror.ErrNotFound
 	}
-
-	var it models.Itinerary
-	if err := s.db.First(&it, "id = ?", act.ItineraryID).Error; err != nil {
-		return nil, apperror.ErrNotFound
-	}
-
-	if it.OwnerID.String() != ownerID {
-		return nil, apperror.ErrForbidden
+	if err := CheckEditAccess(s.db, act.ItineraryID.String(), userID); err != nil {
+		return nil, err
 	}
 	return &act, nil
 }
 
-func (s *ActivityService) Create(ownerID string, input CreateActivityInput) (*models.Activity, error) {
+func (s *ActivityService) Create(userID string, input CreateActivityInput) (*models.Activity, error) {
 	itID, err := uuid.Parse(input.ItineraryID)
 	if err != nil {
 		return nil, errors.New("invalid itinerary_id")
@@ -98,10 +100,9 @@ func (s *ActivityService) Create(ownerID string, input CreateActivityInput) (*mo
 		}
 	}
 
-	// Verify ownership
-	var it models.Itinerary
-	if err := s.db.First(&it, "id = ? AND owner_id = ?", itID, ownerID).Error; err != nil {
-		return nil, errors.New("itinerary not found or forbidden")
+	// Verify edit access (owner or EDITOR collaborator)
+	if err := CheckEditAccess(s.db, itID.String(), userID); err != nil {
+		return nil, err
 	}
 
 	act := models.Activity{
@@ -126,8 +127,8 @@ func (s *ActivityService) Create(ownerID string, input CreateActivityInput) (*mo
 	return &act, nil
 }
 
-func (s *ActivityService) Update(id, ownerID string, input UpdateActivityInput) (*models.Activity, error) {
-	act, err := s.isOwnerOfActivity(id, ownerID)
+func (s *ActivityService) Update(id, userID string, input UpdateActivityInput) (*models.Activity, error) {
+	act, err := s.checkActivityEditAccess(id, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -193,26 +194,83 @@ func (s *ActivityService) Update(id, ownerID string, input UpdateActivityInput) 
 	return act, nil
 }
 
-func (s *ActivityService) Delete(id, ownerID string) error {
-	_, err := s.isOwnerOfActivity(id, ownerID)
+// Delete removes the activity and returns the itinerary_id it belonged to,
+// so the caller can broadcast a WebSocket event to the right room.
+func (s *ActivityService) Delete(id, userID string) (uuid.UUID, error) {
+	act, err := s.checkActivityEditAccess(id, userID)
 	if err != nil {
-		return err
+		return uuid.Nil, err
 	}
-	return s.db.Delete(&models.Activity{}, "id = ?", id).Error
+	if err := s.db.Delete(&models.Activity{}, "id = ?", id).Error; err != nil {
+		return uuid.Nil, err
+	}
+	return act.ItineraryID, nil
 }
 
-func (s *ActivityService) Reorder(ownerID string, items []ReorderItem) error {
-	for _, item := range items {
-		act, err := s.isOwnerOfActivity(item.ID, ownerID)
-		if err != nil {
-			return err
-		}
-		if err := s.db.Model(act).Updates(map[string]interface{}{
-			"day_number":  item.DayNumber,
-			"order_index": item.OrderIndex,
-		}).Error; err != nil {
-			return err
-		}
+// Reorder applies day_number/order_index updates and returns the itinerary_id
+// the items belong to, so the caller can broadcast a WebSocket event.
+func (s *ActivityService) Reorder(userID string, items []ReorderItem) (uuid.UUID, error) {
+	if len(items) == 0 {
+		return uuid.Nil, nil
 	}
-	return nil
+	// Cap at 10k to keep the -1000000-i staging trick collision-free and to
+	// reject obviously-malformed requests (no real itinerary needs this many
+	// reorders in a single call).
+	if len(items) > 10_000 {
+		return uuid.Nil, apperror.ErrInvalidInput
+	}
+	ids := make([]string, len(items))
+	for i, it := range items {
+		ids[i] = it.ID
+	}
+
+	var itineraryID uuid.UUID
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		// Verify all activities exist and belong to the same itinerary.
+		var rows []models.Activity
+		if err := tx.Select("id", "itinerary_id").
+			Where("id IN ?", ids).Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) != len(items) {
+			return apperror.ErrNotFound
+		}
+		// All activities must share one itinerary — otherwise reorder semantics break.
+		itID := rows[0].ItineraryID
+		for _, r := range rows {
+			if r.ItineraryID != itID {
+				return apperror.ErrInvalidInput
+			}
+		}
+		// Check edit access on the itinerary (owner or EDITOR collaborator).
+		if err := CheckEditAccess(tx, itID.String(), userID); err != nil {
+			return err
+		}
+
+		for i, item := range items {
+			// Move all affected rows out of the visible ordering range first.
+			// Without this phase, swapping 0 <-> 1 can temporarily violate
+			// UNIQUE(itinerary_id, day_number, order_index) before the second
+			// row is updated.
+			if err := tx.Model(&models.Activity{}).
+				Where("id = ?", item.ID).
+				Update("order_index", -1000000-i).Error; err != nil {
+				return err
+			}
+		}
+
+		for _, item := range items {
+			if err := tx.Model(&models.Activity{}).
+				Where("id = ?", item.ID).
+				Updates(map[string]interface{}{
+					"day_number":  item.DayNumber,
+					"order_index": item.OrderIndex,
+				}).Error; err != nil {
+				return err
+			}
+		}
+		itineraryID = itID
+		return nil
+	})
+	return itineraryID, err
 }

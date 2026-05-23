@@ -12,9 +12,7 @@ export type User = {
   email: string;
   full_name: string;
   avatar_url?: string;
-  bio?: string;
-  phone?: string;
-  role?: "user" | "admin";
+  is_admin?: boolean;
   status?: "UNVERIFIED" | "ACTIVE" | "BANNED";
   created_at: string;
 };
@@ -44,14 +42,22 @@ export type Place = {
   priority_score: number;
   best_time_of_day?: string;
   tags: string[];
-  open_time?: string;
-  close_time?: string;
-  hours?: string;
+  hours?: string;                // free-text opening hours, e.g. "08:00–22:00"
   recommended_duration?: number; // minutes
   base_price?: number;           // VND
   phone?: string;
   website?: string;
+  parent_id?: string;
+  sub_attractions?: string[];
+  source_url?: string;
+  metadata?: Record<string, unknown>;
   created_at?: string;
+};
+
+export type DestinationStat = {
+  name: string;
+  slug: string;
+  count: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -147,25 +153,25 @@ export type UpdateActivityInput = Partial<Omit<CreateActivityInput, "itinerary_i
 export type ReorderItem = { id: string; day_number: number; order_index: number };
 
 // ---------------------------------------------------------------------------
-// Combo
+// Combo — mirrors backend models.Combo exactly (do NOT add fields the DB
+// doesn't have; previous drift caused silent data loss on save).
 // ---------------------------------------------------------------------------
 
 export type Combo = {
   id: string;
-  title: string;
   destination: string;
-  description?: string;
+  name: string;
   cover_image?: string;
-  num_days: number;
-  total_cost: number;       // VND sale price
-  original_cost?: number;   // VND original price (before discount)
-  savings_pct?: number;
-  num_places: number;
-  tags: string[];
-  places?: Place[];
-  status?: "DRAFT" | "PUBLISHED" | "ARCHIVED";
-  clone_count?: number;     // how many itineraries created from this combo
+  provider?: string;
+  price_per_person?: number;
+  includes?: string[];
+  benefits?: string[];
+  duration_days?: number;
+  requires_overnight?: boolean;
+  book_url?: string;
+  price_updated_at?: string;
   created_at?: string;
+  updated_at?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -180,10 +186,14 @@ export type GenerateRequest = {
   budget_vnd: number;
   guest_count?: number;
   preference_tags?: string[];
-  travel_style?: "relaxed" | "standard" | "active";
+  required_places?: string[];
+  travel_style?: "relaxed" | "balanced" | "standard" | "active";
   travel_month?: number;
   arrival_time?: string;
   departure_time?: string;
+  daily_start_time?: string;
+  daily_end_time?: string;
+  time_strictness?: "flexible" | "balanced" | "strict";
 };
 
 export type SlotPlace = {
@@ -191,8 +201,8 @@ export type SlotPlace = {
   name: string;
   category: PlaceCategory;
   area?: string;
-  lat: number;
-  lng: number;
+  lat?: number;
+  lng?: number;
   cover_image?: string;
   images?: string[];
   base_price: number;
@@ -211,6 +221,7 @@ export type TimeSlot = {
   slot_type: string;
   is_buffer: boolean;
   combo_covered?: boolean;
+  notes?: string;
   place?: SlotPlace;
 };
 
@@ -283,6 +294,7 @@ export type SessionInfo = {
   last_active?: string;
   message_count: number;
   destination?: string;
+  title?: string;
 };
 
 export type SessionHistory = {
@@ -303,6 +315,15 @@ export type PlanRequest = {
   end_date?: string;
   budget_vnd?: number;
   guest_count?: number;
+  preferences?: string[];
+  preference_tags?: string[];
+  required_places?: string[];
+  travel_style?: "relaxed" | "balanced" | "standard" | "active";
+  arrival_time?: string;
+  departure_time?: string;
+  daily_start_time?: string;
+  daily_end_time?: string;
+  time_strictness?: "flexible" | "balanced" | "strict";
   raw_input?: string;
 };
 
@@ -342,6 +363,9 @@ export type WSEventType =
   | "itinerary.updated"
   | "presence.join"
   | "presence.leave"
+  | "presence.online"
+  | "collaborator.invited"
+  | "collaborator.accepted"
   | "cursor"
   | "error";
 
@@ -353,5 +377,24 @@ export type WSEvent =
   | { type: "itinerary.updated";  payload: { itinerary: Itinerary };             sender?: { user_id: string; full_name: string } }
   | { type: "presence.join";      payload: { user_id: string; full_name?: string } }
   | { type: "presence.leave";     payload: { user_id: string } }
+  // Initial roster sent right after the connection is upgraded.
+  | { type: "presence.online";    payload: Array<{ user_id: string; full_name: string }> }
+  // Per-user notification — backend sends through the user channel when a new
+  // collaborator row is created (or when a pending-by-email row is linked).
+  // The invite shape mirrors backend models.Collaborator but loose-typed here
+  // so we don't have to track every backend field change in the FE.
+  | { type: "collaborator.invited";  payload: { invite: WSCollaborator; inviter_name?: string; itinerary_id: string; itinerary_name?: string } }
+  | { type: "collaborator.accepted"; payload: { invite: WSCollaborator; itinerary_id: string } }
   | { type: "cursor";             payload: { user_id: string; activity_id: string; field?: string } }
   | { type: "error";              payload: { message: string } };
+
+// Loose-typed mirror of backend models.Collaborator — only fields the FE
+// actually surfaces in toasts / badges.
+export type WSCollaborator = {
+  id: string;
+  itinerary_id: string;
+  user_id?: string;
+  email?: string;
+  role: "EDITOR" | "VIEWER";
+  status: "PENDING" | "ACCEPTED";
+};

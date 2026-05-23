@@ -166,6 +166,250 @@ END $$;`,
 				return nil
 			},
 		},
+		{
+			// C6: Add verify_token_expires_at so email verification tokens expire after 24h.
+			ID: "202604300007_verify_token_expiry",
+			Migrate: func(tx *gorm.DB) error {
+				return tx.Exec(`ALTER TABLE schema_travel.users
+					ADD COLUMN IF NOT EXISTS verify_token_expires_at TIMESTAMPTZ;`).Error
+			},
+			Rollback: func(tx *gorm.DB) error {
+				_ = tx.Exec(`ALTER TABLE schema_travel.users DROP COLUMN IF EXISTS verify_token_expires_at;`).Error
+				return nil
+			},
+		},
+		{
+			// AI Planner chat sessions are persisted per user; Redis remains short-term working memory.
+			ID: "202605060008_ai_chat_sessions",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					`CREATE TABLE IF NOT EXISTS schema_travel.ai_chat_sessions (
+						id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+						user_id UUID NOT NULL REFERENCES schema_travel.users(id) ON DELETE CASCADE,
+						title TEXT NOT NULL,
+						destination TEXT,
+						message_count INTEGER NOT NULL DEFAULT 0,
+						saved_itinerary_id UUID REFERENCES schema_travel.itineraries(id) ON DELETE SET NULL,
+						created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+						updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+					);`,
+					`CREATE INDEX IF NOT EXISTS idx_ai_chat_sessions_user_updated
+						ON schema_travel.ai_chat_sessions (user_id, updated_at DESC);`,
+					`ALTER TABLE schema_travel.ai_chat_messages
+						ADD COLUMN IF NOT EXISTS session_id UUID;`,
+					`ALTER TABLE schema_travel.ai_chat_messages
+						ALTER COLUMN itinerary_id DROP NOT NULL;`,
+					`DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_chat_session') THEN
+		ALTER TABLE schema_travel.ai_chat_messages
+		ADD CONSTRAINT fk_chat_session
+		FOREIGN KEY (session_id) REFERENCES schema_travel.ai_chat_sessions(id) ON DELETE CASCADE;
+	END IF;
+END $$;`,
+					`CREATE INDEX IF NOT EXISTS idx_ai_chat_messages_session_created
+						ON schema_travel.ai_chat_messages (session_id, created_at ASC);`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				return nil
+			},
+		},
+		{
+			// GIN indexes on tags arrays for `tags && ARRAY[...]` overlap queries
+			// used by /places and /explore filter (services/place.go, services/itinerary.go).
+			ID: "202605070009_tags_gin_index",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					`CREATE INDEX IF NOT EXISTS idx_places_tags_gin
+						ON schema_travel.places USING GIN (tags);`,
+					`CREATE INDEX IF NOT EXISTS idx_itineraries_tags_gin
+						ON schema_travel.itineraries USING GIN (tags);`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				return nil
+			},
+		},
+		{
+			// E: Pending collaborator invites by email. user_id is no longer
+			// mandatory; email holds the address until LinkPendingInvites runs.
+			ID: "202605110010_collaborator_pending_invites",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					`ALTER TABLE schema_travel.collaborators
+						ALTER COLUMN user_id DROP NOT NULL;`,
+					`ALTER TABLE schema_travel.collaborators
+						ADD COLUMN IF NOT EXISTS email TEXT;`,
+					`DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'collaborators_invitee_present') THEN
+		ALTER TABLE schema_travel.collaborators
+		ADD CONSTRAINT collaborators_invitee_present
+			CHECK (user_id IS NOT NULL OR email IS NOT NULL);
+	END IF;
+END $$;`,
+					`CREATE UNIQUE INDEX IF NOT EXISTS collaborators_pending_email_uniq
+						ON schema_travel.collaborators (itinerary_id, lower(email))
+						WHERE email IS NOT NULL;`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				_ = tx.Exec(`DROP INDEX IF EXISTS schema_travel.collaborators_pending_email_uniq;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.collaborators DROP CONSTRAINT IF EXISTS collaborators_invitee_present;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.collaborators DROP COLUMN IF EXISTS email;`).Error
+				return nil
+			},
+		},
+		{
+			// K: Transactional outbox for WebSocket broadcasts.
+			ID: "202605110011_outbox",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					`CREATE TABLE IF NOT EXISTS schema_travel.outbox (
+						id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+						event_type    TEXT         NOT NULL,
+						room_id       TEXT         NOT NULL,
+						payload       JSONB        NOT NULL,
+						created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+						dispatched_at TIMESTAMPTZ,
+						retry_count   INT          NOT NULL DEFAULT 0,
+						last_error    TEXT
+					);`,
+					`CREATE INDEX IF NOT EXISTS outbox_pending_idx
+						ON schema_travel.outbox (created_at)
+						WHERE dispatched_at IS NULL;`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				_ = tx.Exec(`DROP TABLE IF EXISTS schema_travel.outbox;`).Error
+				return nil
+			},
+		},
+		{
+			// L: Model parent/child attractions so planner prompts schedule
+			// top-level places and describe important sub-attractions in notes.
+			ID: "202605170012_place_parent_sub_attractions",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					`ALTER TABLE schema_travel.places
+						ADD COLUMN IF NOT EXISTS parent_id UUID REFERENCES schema_travel.places(id) ON DELETE SET NULL;`,
+					`ALTER TABLE schema_travel.places
+						ADD COLUMN IF NOT EXISTS sub_attractions TEXT[] NOT NULL DEFAULT '{}';`,
+					`CREATE INDEX IF NOT EXISTS idx_places_parent_id
+						ON schema_travel.places (parent_id);`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				_ = tx.Exec(`DROP INDEX IF EXISTS schema_travel.idx_places_parent_id;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.places DROP COLUMN IF EXISTS sub_attractions;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.places DROP COLUMN IF EXISTS parent_id;`).Error
+				return nil
+			},
+		},
+		{
+			// Per-user role/status for the admin UI. Mirrors
+			// database/migrations/0004_user_role_status.sql so a fresh deploy
+			// that skips the static SQL file gets the same shape.
+			//
+			// Idempotent (ADD COLUMN IF NOT EXISTS / DROP CONSTRAINT IF EXISTS)
+			// so it co-exists with environments where 0004.sql was already
+			// applied manually.
+			ID: "202605200013_user_role_status",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					`ALTER TABLE schema_travel.users
+						ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'user';`,
+					`ALTER TABLE schema_travel.users
+						ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';`,
+					`ALTER TABLE schema_travel.users
+						DROP CONSTRAINT IF EXISTS users_role_check;`,
+					`ALTER TABLE schema_travel.users
+						ADD CONSTRAINT users_role_check CHECK (role IN ('user', 'editor', 'admin'));`,
+					`ALTER TABLE schema_travel.users
+						DROP CONSTRAINT IF EXISTS users_status_check;`,
+					`ALTER TABLE schema_travel.users
+						ADD CONSTRAINT users_status_check CHECK (status IN ('active', 'suspended'));`,
+					`CREATE INDEX IF NOT EXISTS idx_users_role   ON schema_travel.users (role);`,
+					`CREATE INDEX IF NOT EXISTS idx_users_status ON schema_travel.users (status);`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				_ = tx.Exec(`DROP INDEX IF EXISTS schema_travel.idx_users_status;`).Error
+				_ = tx.Exec(`DROP INDEX IF EXISTS schema_travel.idx_users_role;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.users DROP CONSTRAINT IF EXISTS users_status_check;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.users DROP CONSTRAINT IF EXISTS users_role_check;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.users DROP COLUMN IF EXISTS status;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.users DROP COLUMN IF EXISTS role;`).Error
+				return nil
+			},
+		},
+		{
+			// Password-reset tokens. Mirrors database/migrations/0005_password_reset_token.sql
+			// so a fresh deploy that skips the static SQL file gets the same shape.
+			// 64-char hex (32 random bytes) doesn't share verify_token's column —
+			// keeps verification OTP and reset link rotation independent.
+			ID: "202605200014_password_reset_token",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					`ALTER TABLE schema_travel.users
+						ADD COLUMN IF NOT EXISTS reset_token VARCHAR(128);`,
+					`ALTER TABLE schema_travel.users
+						ADD COLUMN IF NOT EXISTS reset_token_expires_at TIMESTAMP WITH TIME ZONE;`,
+					`CREATE INDEX IF NOT EXISTS idx_users_reset_token
+						ON schema_travel.users (reset_token)
+						WHERE reset_token IS NOT NULL;`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				_ = tx.Exec(`DROP INDEX IF EXISTS schema_travel.idx_users_reset_token;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.users DROP COLUMN IF EXISTS reset_token_expires_at;`).Error
+				_ = tx.Exec(`ALTER TABLE schema_travel.users DROP COLUMN IF EXISTS reset_token;`).Error
+				return nil
+			},
+		},
 	})
 
 	return m.Migrate()

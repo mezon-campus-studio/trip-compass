@@ -6,5 +6,9 @@ __v0_jsx-dev-runtime.ts
 # Common ignores
 node_modules/
 .next/
+.pnpm-store/
 .env*.local
 .DS_Store
+
+# TypeScript incremental build cache — machine-local, regenerated each build
+*.tsbuildinfo

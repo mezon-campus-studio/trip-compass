@@ -1,50 +1,68 @@
+// Package middleware — gin middleware adapters.
+//
+// JWTAuth + RequireAdmin are thin wrappers around the session package:
+// session.Resolver owns the auth rules, middleware translates them into
+// HTTP responses. Keeping the logic out of middleware means the same rules
+// apply to non-HTTP entry points (WebSocket handshakes) without duplication.
 package middleware
 
 import (
 	"net/http"
-	"strings"
+	"tripcompass-backend/internal/session"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 )
 
-const UserIDKey = "userID"
+const (
+	// UserIDKey is the gin.Context key used by legacy handlers that called
+	// c.GetString(UserIDKey). New code should use session.FromContext(c).UserID.
+	UserIDKey = "userID"
+)
 
-func JWTAuth(secret string) gin.HandlerFunc {
+// JWTAuth gates a route by resolving an authenticated session from the
+// request. Suspended / missing-user / bad-token are mapped to 401/403.
+//
+// The resolved session is stashed on the gin context so downstream handlers
+// can read it via session.FromContext without another DB hit.
+func JWTAuth(resolver *session.Resolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing or invalid Authorization header"})
+		s, err := resolver.FromRequest(c)
+		if err != nil {
+			c.AbortWithStatusJSON(session.HTTPStatus(err), gin.H{"error": err.Error()})
 			return
 		}
+		// Back-compat for handlers that read UserIDKey directly.
+		c.Set(UserIDKey, s.UserID)
+		c.Next()
+	}
+}
 
-		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-
-		token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, jwt.ErrSignatureInvalid
-			}
-			return []byte(secret), nil
-		})
-
-		if err != nil || !token.Valid {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+// OptionalJWTAuth resolves a session when a valid token is present, but never
+// rejects anonymous public requests. This lets public endpoints personalize or
+// dedupe by user ID while still remaining readable without login.
+func OptionalJWTAuth(resolver *session.Resolver) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if resolver == nil {
+			c.Next()
 			return
 		}
+		if s, err := resolver.FromRequest(c); err == nil {
+			c.Set(UserIDKey, s.UserID)
+		}
+		c.Next()
+	}
+}
 
-		claims, ok := token.Claims.(jwt.MapClaims)
-		if !ok {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token claims"})
+// RequireAdmin gates a route on session.IsAdmin. Must run after JWTAuth so
+// the session is already on the context. Returns 403 for non-admin sessions
+// (vs. 401 from JWTAuth for unauthenticated).
+func RequireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		s := session.FromContext(c)
+		if s == nil || !s.IsAdmin {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
 			return
 		}
-
-		userID, ok := claims["sub"].(string)
-		if !ok || userID == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token subject"})
-			return
-		}
-
-		c.Set(UserIDKey, userID)
 		c.Next()
 	}
 }

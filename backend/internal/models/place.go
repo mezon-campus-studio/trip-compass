@@ -1,6 +1,7 @@
 package models
 
 import (
+	"github.com/lib/pq"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,13 +29,13 @@ type Place struct {
 	Latitude            *float64       `gorm:"column:latitude;index:idx_place_coords" json:"latitude"`
 	Longitude           *float64       `gorm:"column:longitude;index:idx_place_coords" json:"longitude"`
 	CoverImage          *string        `gorm:"column:cover_image" json:"cover_image"`
-	Images              StringArray    `gorm:"type:text[]" json:"images"`
+	Images              pq.StringArray `gorm:"type:text[]" json:"images"`
 	Rating              *float64       `gorm:"index:idx_place_rating" json:"rating"`
 	ReviewCount         int            `gorm:"column:review_count;not null;default:0" json:"review_count"`
 	MustVisit           bool           `gorm:"column:must_visit;not null;default:false" json:"must_visit"`
 	PriorityScore       int            `gorm:"column:priority_score;not null;default:0" json:"priority_score"`
 	BestTimeOfDay       *string        `gorm:"column:best_time_of_day" json:"best_time_of_day"`
-	Tags                StringArray    `gorm:"type:text[];column:tags" json:"tags"`
+	Tags                pq.StringArray `gorm:"type:text[];column:tags" json:"tags"`
 	OpenTime            *string        `gorm:"column:open_time;type:time without time zone" json:"open_time"`
 	CloseTime           *string        `gorm:"column:close_time;type:time without time zone" json:"close_time"`
 	Hours               *string        `json:"hours"`
@@ -42,13 +43,15 @@ type Place struct {
 	BasePrice           *int           `gorm:"column:base_price" json:"base_price"`
 	Phone               *string        `gorm:"column:phone" json:"phone"`
 	Website             *string        `json:"website"`
-	ExternalID          *string        `gorm:"column:external_id;uniqueIndex:idx_place_external" json:"external_id"`
-	ExternalSource      *string        `gorm:"column:external_source;uniqueIndex:idx_place_external" json:"external_source"`
-	Metadata            datatypes.JSON `gorm:"type:jsonb" json:"metadata"`
-	SourceURL           *string        `gorm:"column:source_url" json:"source_url"`
-	PriceUpdatedAt      *time.Time     `gorm:"column:price_updated_at" json:"price_updated_at"`
-	CreatedAt           time.Time      `json:"created_at"`
-	UpdatedAt           time.Time      `json:"updated_at"`
+	ExternalID          *string        `gorm:"column:external_id;uniqueIndex:idx_place_external" json:"-"`
+	ExternalSource      *string        `gorm:"column:external_source;uniqueIndex:idx_place_external" json:"-"`
+	ParentID            *uuid.UUID     `gorm:"column:parent_id;type:uuid" json:"parent_id,omitempty"`
+	SubAttractions      pq.StringArray `gorm:"type:text[];column:sub_attractions" json:"sub_attractions"`
+	Metadata            datatypes.JSON `gorm:"type:jsonb" json:"-"`
+	SourceURL           *string        `gorm:"column:source_url" json:"-"`
+	PriceUpdatedAt      *time.Time     `gorm:"column:price_updated_at" json:"-"`
+	CreatedAt           time.Time      `json:"-"`
+	UpdatedAt           time.Time      `json:"-"`
 }
 
 func (p *Place) BeforeCreate(tx *gorm.DB) error {

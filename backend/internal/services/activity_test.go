@@ -11,30 +11,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ─── isOwnerOfActivity ───────────────────────────────────────────────────────
+// ─── checkActivityEditAccess ─────────────────────────────────────────────────
 
-func TestActivityService_IsOwnerOfActivity(t *testing.T) {
+func TestActivityService_CheckActivityEditAccess(t *testing.T) {
 	db := setupTestDB(t)
 	svc := NewActivityService(db)
 	user := createTestUser(t, db)
 	it := createTestItinerary(t, db, user.ID)
 	act := createTestActivity(t, db, it.ID)
 
-	t.Run("success", func(t *testing.T) {
-		got, err := svc.isOwnerOfActivity(act.ID.String(), user.ID.String())
+	t.Run("owner success", func(t *testing.T) {
+		got, err := svc.checkActivityEditAccess(act.ID.String(), user.ID.String())
 		require.NoError(t, err)
 		assert.Equal(t, act.ID, got.ID)
 	})
 
 	t.Run("activity not found", func(t *testing.T) {
-		_, err := svc.isOwnerOfActivity(uuid.New().String(), user.ID.String())
+		_, err := svc.checkActivityEditAccess(uuid.New().String(), user.ID.String())
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, apperror.ErrNotFound)
 	})
 
-	t.Run("wrong owner", func(t *testing.T) {
+	t.Run("wrong user (no collaborator)", func(t *testing.T) {
 		otherUser := createTestUserWith(t, db, "other@example.com")
-		_, err := svc.isOwnerOfActivity(act.ID.String(), otherUser.ID.String())
+		_, err := svc.checkActivityEditAccess(act.ID.String(), otherUser.ID.String())
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, apperror.ErrForbidden)
 	})
@@ -88,7 +88,7 @@ func TestActivityService_Create(t *testing.T) {
 		}
 		_, err := svc.Create(otherUser.ID.String(), input)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "itinerary not found or forbidden")
+		assert.ErrorIs(t, err, apperror.ErrForbidden)
 	})
 
 	t.Run("with optional fields", func(t *testing.T) {
@@ -195,8 +195,9 @@ func TestActivityService_Delete(t *testing.T) {
 
 	t.Run("success", func(t *testing.T) {
 		act := createTestActivity(t, db, it.ID)
-		err := svc.Delete(act.ID.String(), user.ID.String())
+		itID, err := svc.Delete(act.ID.String(), user.ID.String())
 		assert.NoError(t, err)
+		assert.Equal(t, it.ID, itID)
 
 		var count int64
 		db.Model(&models.Activity{}).Where("id = ?", act.ID).Count(&count)
@@ -206,13 +207,13 @@ func TestActivityService_Delete(t *testing.T) {
 	t.Run("forbidden", func(t *testing.T) {
 		act := createTestActivity(t, db, it.ID)
 		otherUser := createTestUserWith(t, db, "other3@example.com")
-		err := svc.Delete(act.ID.String(), otherUser.ID.String())
+		_, err := svc.Delete(act.ID.String(), otherUser.ID.String())
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, apperror.ErrForbidden)
 	})
 
 	t.Run("activity not found", func(t *testing.T) {
-		err := svc.Delete(uuid.New().String(), user.ID.String())
+		_, err := svc.Delete(uuid.New().String(), user.ID.String())
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, apperror.ErrNotFound)
 	})
@@ -229,13 +230,34 @@ func TestActivityService_Reorder(t *testing.T) {
 	act1 := createTestActivity(t, db, it.ID)
 	act2 := createTestActivity(t, db, it.ID)
 
+	t.Run("swaps within same day without unique conflict", func(t *testing.T) {
+		items := []ReorderItem{
+			{ID: act1.ID.String(), DayNumber: 1, OrderIndex: 1},
+			{ID: act2.ID.String(), DayNumber: 1, OrderIndex: 0},
+		}
+		itID, err := svc.Reorder(user.ID.String(), items)
+		assert.NoError(t, err)
+		assert.Equal(t, it.ID, itID)
+
+		var a1 models.Activity
+		db.First(&a1, "id = ?", act1.ID)
+		assert.Equal(t, 1, a1.DayNumber)
+		assert.Equal(t, 1, a1.OrderIndex)
+
+		var a2 models.Activity
+		db.First(&a2, "id = ?", act2.ID)
+		assert.Equal(t, 1, a2.DayNumber)
+		assert.Equal(t, 0, a2.OrderIndex)
+	})
+
 	t.Run("success", func(t *testing.T) {
 		items := []ReorderItem{
 			{ID: act1.ID.String(), DayNumber: 2, OrderIndex: 1},
 			{ID: act2.ID.String(), DayNumber: 2, OrderIndex: 2},
 		}
-		err := svc.Reorder(user.ID.String(), items)
+		itID, err := svc.Reorder(user.ID.String(), items)
 		assert.NoError(t, err)
+		assert.Equal(t, it.ID, itID)
 
 		// Verify changes
 		var a1 models.Activity
@@ -253,7 +275,7 @@ func TestActivityService_Reorder(t *testing.T) {
 		items := []ReorderItem{
 			{ID: uuid.New().String(), DayNumber: 1, OrderIndex: 0},
 		}
-		err := svc.Reorder(user.ID.String(), items)
+		_, err := svc.Reorder(user.ID.String(), items)
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, apperror.ErrNotFound)
 	})
@@ -263,7 +285,7 @@ func TestActivityService_Reorder(t *testing.T) {
 		items := []ReorderItem{
 			{ID: act1.ID.String(), DayNumber: 3, OrderIndex: 0},
 		}
-		err := svc.Reorder(otherUser.ID.String(), items)
+		_, err := svc.Reorder(otherUser.ID.String(), items)
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, apperror.ErrForbidden)
 	})

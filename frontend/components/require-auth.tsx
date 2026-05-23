@@ -9,6 +9,7 @@
 import { useEffect, type ReactNode } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import { useAuth } from "@/hooks/use-auth";
+import { useUserNotifications } from "@/hooks/use-user-notifications";
 
 type RequireAuthProps = {
   children: ReactNode;
@@ -48,11 +49,28 @@ export function RequireAuth({ children, fallback = null }: RequireAuthProps) {
   }, [loading, user, pathname, router]);
 
   if (loading || !user) return <>{fallback}</>;
-  return <>{children}</>;
+  return (
+    <>
+      <NotificationsBridge />
+      {children}
+    </>
+  );
+}
+
+/**
+ * Mounts the per-user WS notification channel for the logged-in user.
+ * Extracted so the hook only runs once we know `user` is non-null — calling
+ * it inside RequireAuth's main body would mount it during the loading state
+ * too and open a socket with a stale/empty token.
+ */
+function NotificationsBridge() {
+  useUserNotifications();
+  return null;
 }
 
 // ---------------------------------------------------------------------------
-// RequireAdmin — additionally checks user.role === "admin"
+// RequireAdmin — additionally checks user.is_admin === true
+// is_admin is derived server-side from ADMIN_EMAILS and surfaced on /auth/me.
 // ---------------------------------------------------------------------------
 
 type RequireAdminProps = {
@@ -69,12 +87,12 @@ export function RequireAdmin({ children, fallback = null }: RequireAdminProps) {
     if (!loading) {
       if (!user) {
         router.replace(`/auth/login?redirect=${encodeURIComponent(pathname)}`);
-      } else if (user.role !== "admin") {
+      } else if (!user.is_admin) {
         router.replace("/");
       }
     }
   }, [loading, user, pathname, router]);
 
-  if (loading || !user || user.role !== "admin") return <>{fallback}</>;
+  if (loading || !user || !user.is_admin) return <>{fallback}</>;
   return <>{children}</>;
 }
