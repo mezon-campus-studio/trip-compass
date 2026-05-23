@@ -4,17 +4,24 @@ import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical, MapPin, Sparkles, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { formatVND } from "@/lib/format";
 import type { Activity } from "../_lib/types";
 import { TYPE_COLOR, TYPE_LABELS } from "../_lib/constants";
 
 export function SortableActivityCard({
   activity,
+  mapIndex,
+  dayColor,
   onRemove,
   onEdit,
   onHover,
   isActive,
 }: {
   activity: Activity;
+  /** 1-based index that mirrors the numbered marker on the map. */
+  mapIndex?: number;
+  /** Day color for the marker badge. */
+  dayColor?: string;
   onRemove: () => void;
   onEdit: () => void;
   onHover?: (id: string | null) => void;
@@ -54,6 +61,21 @@ export function SortableActivityCard({
             <GripVertical className="w-3.5 h-3.5" />
           </button>
 
+          {/* Map marker index — only when this activity has coords */}
+          {mapIndex != null && (
+            <span
+              className="inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] font-mono font-semibold leading-none shrink-0"
+              style={{
+                background: dayColor ?? "#1a1a1a",
+                color: "#f5f0e8",
+              }}
+              title={`Marker #${mapIndex} trên bản đồ`}
+              aria-label={`Marker ${mapIndex} trên bản đồ`}
+            >
+              {mapIndex}
+            </span>
+          )}
+
           <span className="text-[11px] font-mono tracking-wider nums" style={{ color: color.text }}>
             {activity.time}
           </span>
@@ -90,7 +112,7 @@ export function SortableActivityCard({
           <div className="flex items-center gap-3 text-[11px]">
             <span className="nums text-[#8b8378] font-mono">{activity.duration}m</span>
             {activity.cost > 0
-              ? <span className="nums font-mono font-semibold text-[#1a1a1a]">{activity.cost.toLocaleString("vi-VN")} ₫</span>
+              ? <span className="nums font-mono font-semibold text-[#1a1a1a]">{formatVND(activity.cost)}</span>
               : <span className="text-[#b8b1a6] italic">Miễn phí</span>
             }
           </div>

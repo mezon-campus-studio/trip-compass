@@ -1,14 +1,15 @@
 """
 routes/plan.py — POST /plan endpoint (structured travel planning).
 """
-import json
 import time
 import uuid
 from fastapi import APIRouter, HTTPException
 from loguru import logger
 
 from app.schemas import PlanRequest, PlanResponse
-from app.services.plan_cache import get_cached_plan, cache_plan
+from app.services.plan_cache import build_plan_cache_key, get_cached_plan, cache_plan
+from app.services.planning_service import generate_travel_plan
+from app.nodes.resolve import UnresolvedDestinationError
 
 router = APIRouter(tags=["plan"])
 
@@ -17,33 +18,50 @@ router = APIRouter(tags=["plan"])
 async def generate_plan(req: PlanRequest):
     t0         = time.time()
     session_id = str(uuid.uuid4())
-    cache_key  = f"{req.destination}:{req.num_days}:{req.guest_count}:{req.budget_vnd}:{req.start_date}"
+    cache_key  = build_plan_cache_key(req)
 
     # Cache hit
     cached = await get_cached_plan(cache_key)
     if cached:
         logger.info(f"[/plan] cache HIT key={cache_key!r}")
         return PlanResponse(
-            session_id=session_id, destination=req.destination,
+            session_id=session_id, destination=cached.get("destination", req.destination),
             budget_tier=cached.get("budget_tier", "standard"),
             final_plan=cached.get("plan", {}),
             budget_breakdown=cached.get("budget_breakdown", {}),
-            warnings=["Kết quả từ cache."], violations=[],
-            validation_passed=True, duration_ms=int((time.time()-t0)*1000), cache_hit=True,
+            warnings=["Kết quả từ cache.", *cached.get("warnings", [])],
+            violations=cached.get("violations", []),
+            validation_passed=cached.get("validation_passed", False),
+            duration_ms=int((time.time()-t0)*1000),
+            cache_hit=True,
         )
 
-    # Call tool directly
-    from app.tools.create_plan import create_travel_plan
     try:
-        result_json = await create_travel_plan.ainvoke({
-            "destination": req.destination,
-            "num_days":    req.num_days,
-            "budget_vnd":  req.budget_vnd or 0,
-            "guest_count": req.guest_count,
-            "start_date":  req.start_date,
-            "end_date":    req.end_date,
-        })
-        result = json.loads(result_json)
+        result = await generate_travel_plan(
+            destination=req.destination,
+            num_days=req.num_days,
+            budget_vnd=req.budget_vnd or 0,
+            guest_count=req.guest_count,
+            start_date=req.start_date,
+            end_date=req.end_date,
+            travel_style=req.travel_style,
+            arrival_time=req.arrival_time,
+            departure_time=req.departure_time,
+            daily_start_time=req.daily_start_time,
+            daily_end_time=req.daily_end_time,
+            time_strictness=req.time_strictness,
+            preferences=req.preferences,
+            required_places=req.required_places,
+            raw_input=req.raw_input,
+            need_hotel=req.need_hotel,
+            need_flight=req.need_flight,
+            # /plan direct serves the structured-form UI which renders enrich
+            # descriptions/tips. Chat path opts out of enrich for speed.
+            include_enrich=True,
+        )
+    except UnresolvedDestinationError as e:
+        logger.info(f"[/plan] unresolved destination: {req.destination!r}")
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"[/plan] {e}")
         raise HTTPException(status_code=500, detail=str(e))

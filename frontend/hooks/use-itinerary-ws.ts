@@ -22,7 +22,7 @@ type UseItineraryWSReturn = {
  * dispatches realtime events to `onEvent`.
  *
  * Behaviour:
- * - Connects when both `itineraryId` and `token` are available.
+ * - Connects when both `itineraryId` and a logged-in `user` are available.
  * - Disconnects on unmount.
  * - Auto-reconnects on close with exponential backoff (1s → 2s → 4s → … max 30s).
  * - On reconnect, caller should re-fetch `GET /itineraries/:id` to sync any
@@ -35,7 +35,10 @@ export function useItineraryWS(
   onEvent: (e: WSEvent) => void,
   onReconnect?: () => void,
 ): UseItineraryWSReturn {
-  const { token } = useAuth();
+  // Auth rides on the HttpOnly cookie sent on the WS upgrade — the browser
+  // attaches it automatically. We only need to know whether there's a logged-in
+  // user so we don't try to connect anonymously.
+  const { user } = useAuth();
   const wsRef     = useRef<WebSocket | null>(null);
   const retryRef  = useRef(0);
   // Stable ref so the reconnect closure always sees the latest callback
@@ -51,19 +54,21 @@ export function useItineraryWS(
   }, []);
 
   useEffect(() => {
-    if (!token || !itineraryId) return;
+    if (!user || !itineraryId) return;
 
     let cancelled = false;
 
     const connect = () => {
-      const url = `${WS_URL}/itinerary/${itineraryId}?token=${encodeURIComponent(token)}`;
+      // Token rides on Sec-WebSocket-Protocol so it does not land in URLs or
+      // reverse-proxy access logs.
+      const url = `${WS_URL}/itinerary/${itineraryId}`;
       const ws  = new WebSocket(url);
       wsRef.current = ws;
 
       ws.onopen = () => {
+        const wasReconnect = retryRef.current > 0; // capture before reset
         retryRef.current = 0;
-        // If this is a reconnect (not the first open), sync state
-        if (retryRef.current > 0) onReconnectRef.current?.();
+        if (wasReconnect) onReconnectRef.current?.(); // Bug 5: now fires correctly
       };
 
       ws.onmessage = (m) => {
@@ -80,8 +85,10 @@ export function useItineraryWS(
       ws.onclose = () => {
         wsRef.current = null;
         if (cancelled) return;
-        // Reconnect with exponential backoff — max 30s
-        const delay = Math.min(30_000, 1_000 * 2 ** retryRef.current);
+        // Exponential backoff with ±20% jitter so a server restart doesn't
+        // produce a thundering herd of simultaneous reconnects. Max 30s.
+        const base = Math.min(30_000, 1_000 * 2 ** retryRef.current);
+        const delay = Math.round(base * (0.8 + Math.random() * 0.4));
         retryRef.current += 1;
         setTimeout(connect, delay);
       };
@@ -94,7 +101,7 @@ export function useItineraryWS(
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [itineraryId, token]);
+  }, [itineraryId, user]);
 
   return { send };
 }

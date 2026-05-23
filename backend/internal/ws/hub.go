@@ -1,9 +1,8 @@
 package ws
 
 import (
-	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -12,6 +11,9 @@ import (
 )
 
 // ─── Message protocol ─────────────────────────────────────────────────────────
+// Event types match docs/integration/04-ITINERARY-COLLAB-FLOW.md §5 — and the
+// WSEventType union in frontend/lib/types.ts. Anything emitted from the server
+// MUST match a case in that union or the FE will silently drop it.
 
 type Message struct {
 	Type    string          `json:"type"`
@@ -24,6 +26,29 @@ type SenderInfo struct {
 	FullName string `json:"full_name"`
 }
 
+const (
+	EventPresenceJoin   = "presence.join"
+	EventPresenceLeave  = "presence.leave"
+	EventPresenceOnline = "presence.online" // initial roster sent to the joiner
+
+	EventActivityCreated   = "activity.created"
+	EventActivityUpdated   = "activity.updated"
+	EventActivityDeleted   = "activity.deleted"
+	EventActivityReordered = "activity.reordered"
+	EventItineraryUpdated  = "itinerary.updated"
+
+	// User-scope events — delivered via per-user channels rather than
+	// itinerary rooms. See BroadcastToUser.
+	EventCollaboratorInvited  = "collaborator.invited"
+	EventCollaboratorAccepted = "collaborator.accepted"
+
+	EventError = "error"
+)
+
+// UserRoomPrefix marks a "room" id as targeting a user channel rather than
+// an itinerary. Used so the same hub map can carry both routing semantics.
+const UserRoomPrefix = "user:"
+
 // ─── Client ───────────────────────────────────────────────────────────────────
 
 const (
@@ -34,25 +59,40 @@ const (
 )
 
 type Client struct {
-	ID       string
-	UserID   string
-	FullName string
-	RoomID   string
-	Hub      *Hub
-	Conn     *websocket.Conn
-	Send     chan []byte
+	ID        string
+	UserID    string
+	FullName  string
+	RoomID    string
+	// Role cached at upgrade time ("OWNER" | "EDITOR" | "VIEWER"). Empty for
+	// user-scope clients (notification channels) where role doesn't apply.
+	Role      string
+	Hub       *Hub
+	Conn      *websocket.Conn
+	Send      chan []byte
+	closeOnce sync.Once
 }
 
-func NewClient(hub *Hub, conn *websocket.Conn, roomID, userID, fullName string) *Client {
+func NewClient(hub *Hub, conn *websocket.Conn, roomID, userID, fullName, role string) *Client {
 	return &Client{
 		ID:       uuid.New().String(),
 		UserID:   userID,
 		FullName: fullName,
 		RoomID:   roomID,
+		Role:     role,
 		Hub:      hub,
 		Conn:     conn,
 		Send:     make(chan []byte, 256),
 	}
+}
+
+// allowedClientEventTypes lists the only message types a connected client may
+// originate. After the server-authoritative refactor, every mutation
+// (activity.created / updated / deleted / reordered, itinerary.updated) is
+// emitted by the HTTP handlers themselves; clients only ever send presence /
+// hover / typing pings. Anything else is rejected with an error frame.
+var allowedClientEventTypes = map[string]bool{
+	"cursor": true,
+	"typing": true,
 }
 
 // ReadPump đọc messages từ WebSocket connection
@@ -73,7 +113,7 @@ func (c *Client) ReadPump() {
 		_, raw, err := c.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				log.Printf("[WS] Read error client=%s: %v", c.UserID, err)
+				slog.Warn("ws read error", "client", c.UserID, "err", err)
 			}
 			break
 		}
@@ -81,6 +121,21 @@ func (c *Client) ReadPump() {
 		var msg Message
 		if err := json.Unmarshal(raw, &msg); err != nil {
 			c.sendError("invalid JSON format")
+			continue
+		}
+
+		// Whitelist client-originated events. Everything else (mutations,
+		// presence join/leave) is emitted by the server itself.
+		if !allowedClientEventTypes[msg.Type] {
+			c.sendError("event type not allowed for clients: " + msg.Type)
+			continue
+		}
+
+		// Even within the whitelist, VIEWERs can hover/cursor but typing
+		// (which implies editing) is editor-only. Loosen later if VIEWER
+		// commenting lands.
+		if msg.Type == "typing" && c.Role != "OWNER" && c.Role != "EDITOR" {
+			c.sendError("typing requires editor role")
 			continue
 		}
 
@@ -98,7 +153,7 @@ func (c *Client) ReadPump() {
 
 		// Publish to Redis for cross-server broadcasting
 		if c.Hub.redisPubSub != nil {
-			c.Hub.redisPubSub.Publish(context.TODO(), c.RoomID, data)
+			c.Hub.redisPubSub.Publish(c.Hub.redisPubSub.ctx, c.RoomID, data)
 		}
 	}
 }
@@ -144,10 +199,10 @@ func (c *Client) sendError(msg string) {
 	}
 }
 
-// safeClose closes a channel without panicking if already closed
-func safeClose(ch chan []byte) {
-	defer func() { recover() }()
-	close(ch)
+// closeSend closes the Client.Send channel exactly once, preventing double-close panics.
+// Use this instead of close(c.Send) everywhere.
+func (c *Client) closeSend() {
+	c.closeOnce.Do(func() { close(c.Send) })
 }
 
 // ─── Room ────────────────────────────────────────────────────────────────────
@@ -183,13 +238,14 @@ func (r *Room) IsEmpty() bool {
 	return len(r.Clients) == 0
 }
 
-// Broadcast sends data to all clients except exclude client
+// Broadcast sends data to every client in the room except `exclude`.
+//
+// The hot path takes only a read lock while iterating clients — a write lock
+// is only taken after the loop, and only if buffer-full evictions are needed.
+// Without this split a 50-client room would serialise every broadcast.
 func (r *Room) Broadcast(data []byte, exclude *Client) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
+	r.mu.RLock()
 	var toClose []*Client
-
 	for client := range r.Clients {
 		if client == exclude {
 			continue
@@ -197,16 +253,21 @@ func (r *Room) Broadcast(data []byte, exclude *Client) {
 		select {
 		case client.Send <- data:
 		default:
-			// Buffer full, mark for closure
-			safeClose(client.Send)
+			// Buffer full — close send channel and queue for eviction.
+			client.closeSend()
 			toClose = append(toClose, client)
 		}
 	}
+	r.mu.RUnlock()
 
-	// Remove closed clients after iteration
+	if len(toClose) == 0 {
+		return
+	}
+	r.mu.Lock()
 	for _, client := range toClose {
 		delete(r.Clients, client)
 	}
+	r.mu.Unlock()
 }
 
 func (r *Room) OnlineUsers() []SenderInfo {
@@ -235,6 +296,8 @@ type Hub struct {
 	Unregister  chan *Client
 	mu          sync.RWMutex
 	redisPubSub *RedisPubSub
+	instanceID  string
+	stop        chan struct{}
 
 	// Track which rooms have Redis subscriptions
 	subscribedRooms map[string]bool
@@ -246,6 +309,8 @@ func NewHub() *Hub {
 		Rooms:           make(map[string]*Room),
 		Register:        make(chan *Client),
 		Unregister:      make(chan *Client),
+		instanceID:      uuid.New().String(),
+		stop:            make(chan struct{}),
 		subscribedRooms: make(map[string]bool),
 	}
 }
@@ -262,8 +327,15 @@ func (h *Hub) Run() {
 			h.addClient(client)
 		case client := <-h.Unregister:
 			h.removeClient(client)
+		case <-h.stop:
+			return
 		}
 	}
+}
+
+// Stop signals the Hub.Run goroutine to exit.
+func (h *Hub) Stop() {
+	close(h.stop)
 }
 
 func (h *Hub) addClient(c *Client) {
@@ -274,51 +346,55 @@ func (h *Hub) addClient(c *Client) {
 		h.Rooms[c.RoomID] = room
 		// Subscribe to Redis channel for this room (cross-server messages)
 		if h.redisPubSub != nil {
-			h.redisPubSub.SubscribeRoom(context.TODO(), c.RoomID)
+			h.redisPubSub.SubscribeRoom(h.redisPubSub.ctx, c.RoomID)
 			h.subscribeMu.Lock()
 			h.subscribedRooms[c.RoomID] = true
 			h.subscribeMu.Unlock()
 		}
 	}
-	h.mu.Unlock()
-
+	// M5: AddClient inside hub lock — prevents room deletion race between Unlock and AddClient
 	room.AddClient(c)
+	h.mu.Unlock()
 
 	// Track user online in Redis
 	if h.redisPubSub != nil {
-		h.redisPubSub.TrackOnline(context.TODO(), c.RoomID, c.UserID)
+		h.redisPubSub.TrackOnline(h.redisPubSub.ctx, c.RoomID, c.UserID)
 	}
 
-	// Notify room: user joined
+	// Notify room: user joined. Payload mirrors the FE's WSEvent shape so
+	// frontend/app/itinerary/[id]/edit/_hooks/use-editor-state.ts handles it
+	// directly (it switches on type === "presence.join").
+	joinPayload, _ := json.Marshal(map[string]string{
+		"user_id":   c.UserID,
+		"full_name": c.FullName,
+	})
 	joinMsg := Message{
-		Type: "user_joined",
-		Sender: &SenderInfo{
-			UserID:   c.UserID,
-			FullName: c.FullName,
-		},
+		Type:    EventPresenceJoin,
+		Payload: joinPayload,
+		Sender:  &SenderInfo{UserID: c.UserID, FullName: c.FullName},
 	}
 	data, _ := json.Marshal(joinMsg)
 	room.Broadcast(data, c)
 
 	// Also publish to Redis for cross-server
 	if h.redisPubSub != nil {
-		h.redisPubSub.Publish(context.TODO(), c.RoomID, data)
+		h.redisPubSub.Publish(h.redisPubSub.ctx, c.RoomID, data)
 	}
 
-	// Send online users list to the new client
-	onlineMsg := Message{
-		Type: "online_users",
-	}
+	// Send the current roster to the new joiner. presence.online is the
+	// initial snapshot; subsequent join/leave events keep it in sync.
 	users := room.OnlineUsers()
 	usersData, _ := json.Marshal(users)
-	onlineMsg.Payload = usersData
-	onlineData, _ := json.Marshal(onlineMsg)
+	onlineData, _ := json.Marshal(Message{
+		Type:    EventPresenceOnline,
+		Payload: usersData,
+	})
 	select {
 	case c.Send <- onlineData:
 	default:
 	}
 
-	log.Printf("[WS] User %s (%s) joined room %s", c.UserID, c.FullName, c.RoomID)
+	slog.Info("ws client joined", "user_id", c.UserID, "name", c.FullName, "room", c.RoomID)
 }
 
 func (h *Hub) removeClient(c *Client) {
@@ -330,27 +406,26 @@ func (h *Hub) removeClient(c *Client) {
 	}
 
 	room.RemoveClient(c)
-	safeClose(c.Send)
+	c.closeSend()
 
 	// Track user offline in Redis
 	if h.redisPubSub != nil {
-		h.redisPubSub.TrackOffline(context.TODO(), c.RoomID, c.UserID)
+		h.redisPubSub.TrackOffline(h.redisPubSub.ctx, c.RoomID, c.UserID)
 	}
 
 	// Notify room: user left
+	leavePayload, _ := json.Marshal(map[string]string{"user_id": c.UserID})
 	leaveMsg := Message{
-		Type: "user_left",
-		Sender: &SenderInfo{
-			UserID:   c.UserID,
-			FullName: c.FullName,
-		},
+		Type:    EventPresenceLeave,
+		Payload: leavePayload,
+		Sender:  &SenderInfo{UserID: c.UserID, FullName: c.FullName},
 	}
 	data, _ := json.Marshal(leaveMsg)
 	room.Broadcast(data, nil)
 
 	// Also publish to Redis for cross-server
 	if h.redisPubSub != nil {
-		h.redisPubSub.Publish(context.TODO(), c.RoomID, data)
+		h.redisPubSub.Publish(h.redisPubSub.ctx, c.RoomID, data)
 	}
 
 	// Cleanup empty rooms
@@ -368,7 +443,7 @@ func (h *Hub) removeClient(c *Client) {
 		h.subscribeMu.Unlock()
 	}
 
-	log.Printf("[WS] User %s (%s) left room %s", c.UserID, c.FullName, c.RoomID)
+	slog.Info("ws client left", "user_id", c.UserID, "name", c.FullName, "room", c.RoomID)
 }
 
 func (h *Hub) BroadcastToRoom(roomID string, data []byte, exclude *Client) {
@@ -379,6 +454,13 @@ func (h *Hub) BroadcastToRoom(roomID string, data []byte, exclude *Client) {
 		return
 	}
 	room.Broadcast(data, exclude)
+}
+
+// BroadcastToUser fans an event out to every active tab a user has open.
+// Internally it reuses the room infrastructure with the "user:" prefix —
+// connecting to /ws/user joins room "user:<id>".
+func (h *Hub) BroadcastToUser(userID string, data []byte) {
+	h.BroadcastToRoom(UserRoomPrefix+userID, data, nil)
 }
 
 func (h *Hub) GetRoom(roomID string) *Room {

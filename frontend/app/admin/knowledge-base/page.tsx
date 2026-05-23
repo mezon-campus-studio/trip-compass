@@ -1,12 +1,10 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useState, useRef } from "react"
 import { Brain, FileText, Upload, Search, Plus, MoreVertical, Trash2, Edit2, Eye, FileCheck2, FileClock, Link as LinkIcon, Loader2, RefreshCw } from "lucide-react"
 import { AdminShell } from "@/components/admin/admin-shell"
 import { cn } from "@/lib/utils"
 import { toast } from "sonner"
-
-const PLANNER_AI = process.env.NEXT_PUBLIC_PLANNER_AI_URL ?? ""
 
 type KBDoc = {
   id: string
@@ -45,56 +43,29 @@ export default function KnowledgeBasePage() {
   const [docs, setDocs] = useState<KBDoc[]>([])
   const [sources, setSources] = useState<KBSource[]>([])
   const [loading, setLoading] = useState(true)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
-    try {
-      const [docsRes, sourcesRes] = await Promise.allSettled([
-        fetch(`${PLANNER_AI}/knowledge/documents`).then((r) => r.json()),
-        fetch(`${PLANNER_AI}/knowledge/sources`).then((r) => r.json()),
-      ])
-      if (docsRes.status === "fulfilled") setDocs(docsRes.value?.data ?? docsRes.value ?? [])
-      if (sourcesRes.status === "fulfilled") setSources(sourcesRes.value?.data ?? sourcesRes.value ?? [])
-    } catch {
-      // Planner-AI may not be running locally
-    } finally {
-      setLoading(false)
-    }
+    setDocs([])
+    setSources([])
+    setLoading(false)
   }, [])
 
   useEffect(() => { load() }, [load])
 
   const handleDelete = async (id: string) => {
-    try {
-      setDocs((prev) => prev.filter((d) => d.id !== id))
-      await fetch(`${PLANNER_AI}/knowledge/documents/${id}`, { method: "DELETE" })
-      toast.success("Đã xoá tài liệu")
-    } catch {
-      toast.error("Xoá thất bại")
-      load()
-    } finally {
-      setMenuOpen(null)
-    }
+    toast.info(`Knowledge document #${id} chưa có API production`)
+    setMenuOpen(null)
   }
 
   const handleReindex = async (id: string) => {
-    try {
-      await fetch(`${PLANNER_AI}/knowledge/documents/${id}/reindex`, { method: "POST" })
-      toast.success("Đã gửi yêu cầu tái index")
-    } catch {
-      toast.error("Tái index thất bại")
-    } finally {
-      setMenuOpen(null)
-    }
+    toast.info(`Reindex document #${id} chưa có API production`)
+    setMenuOpen(null)
   }
 
   const handleCrawl = async (id: string, name: string) => {
-    try {
-      await fetch(`${PLANNER_AI}/knowledge/sources/${id}/crawl`, { method: "POST" })
-      toast.success(`Đang quét ${name}...`)
-    } catch {
-      toast.error("Quét thất bại")
-    }
+    toast.info(`Crawl source ${name} (${id}) chưa có API production`)
   }
 
   const filteredDocs = docs.filter((d) => !search || d.title.toLowerCase().includes(search.toLowerCase()))
@@ -106,12 +77,24 @@ export default function KnowledgeBasePage() {
       action={
         <div className="flex gap-2">
           <button
-            onClick={() => toast.info("Upload modal sẽ mở")}
+            onClick={() => fileInputRef.current?.click()}
             className="px-4 py-2 bg-white border border-[#e8e2d9] rounded-lg text-sm font-medium text-[#1a1a1a] hover:bg-[#f5f0e8] inline-flex items-center gap-2"
           >
             <Upload className="w-4 h-4" />
             Tải lên
           </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pdf,.txt,.md,.docx"
+            className="hidden"
+            onChange={async (e) => {
+              const file = e.target.files?.[0]
+              if (!file) return
+              toast.info(`Upload ${file.name} chưa có API production`)
+              e.target.value = ""
+            }}
+          />
           <button
             onClick={load}
             className="px-4 py-2 bg-white border border-[#e8e2d9] rounded-lg text-sm font-medium text-[#1a1a1a] hover:bg-[#f5f0e8] inline-flex items-center gap-2"
@@ -135,6 +118,10 @@ export default function KnowledgeBasePage() {
         </div>
       ) : (
         <>
+          <div className="mb-6 rounded-2xl border border-[#d4a853]/30 bg-[#d4a853]/10 px-4 py-3 text-sm text-[#6b5a2a]">
+            Knowledge Base chưa có endpoint production trong backend/planner-ai. Trang này tạm thời không gọi planner-ai trực tiếp để tránh lỗi 404 và bypass auth.
+          </div>
+
           {/* Stats */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
             {[

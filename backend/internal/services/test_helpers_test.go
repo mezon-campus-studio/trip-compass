@@ -1,6 +1,7 @@
 package services
 
 import (
+	"github.com/lib/pq"
 	"fmt"
 	"os"
 	"testing"
@@ -38,6 +39,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	err = db.AutoMigrate(
 		&models.User{},
 		&models.Itinerary{},
+		&models.Place{},
 		&models.Activity{},
 		&models.Collaborator{},
 		&models.AIChatMessage{},
@@ -48,7 +50,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 
 	// Clean tables before each test for isolation
 	t.Cleanup(func() {
-		db.Exec("TRUNCATE TABLE activities, collaborators, ai_chat_messages, itineraries, users CASCADE")
+		db.Exec("TRUNCATE TABLE activities, collaborators, ai_chat_messages, itineraries, places, users CASCADE")
 	})
 
 	return db
@@ -95,7 +97,7 @@ func createTestItinerary(t *testing.T, db *gorm.DB, ownerID uuid.UUID) models.It
 		Status:         "DRAFT",
 		BudgetCategory: "MODERATE",
 		GuestCount:     2,
-		Tags:           models.StringArray{"beach", "food"},
+		Tags:           pq.StringArray{"beach", "food"},
 	}
 	if err := db.Create(&itinerary).Error; err != nil {
 		t.Fatalf("failed to create test itinerary: %v", err)

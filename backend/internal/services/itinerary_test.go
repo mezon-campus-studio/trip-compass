@@ -1,9 +1,12 @@
 package services
 
 import (
+	"errors"
+	"github.com/lib/pq"
 	"testing"
 	"time"
 
+	"tripcompass-backend/internal/apperror"
 	"tripcompass-backend/internal/models"
 
 	"github.com/google/uuid"
@@ -27,13 +30,13 @@ func TestParseDate(t *testing.T) {
 	t.Run("empty string", func(t *testing.T) {
 		_, err := parseDate("")
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "không được để trống")
+		assert.Contains(t, err.Error(), "date must not be empty")
 	})
 
 	t.Run("invalid format", func(t *testing.T) {
 		_, err := parseDate("15/06/2025")
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "format phải là YYYY-MM-DD")
+		assert.Contains(t, err.Error(), "date must be YYYY-MM-DD")
 	})
 
 	t.Run("invalid date", func(t *testing.T) {
@@ -57,7 +60,7 @@ func TestSetItineraryDates(t *testing.T) {
 		var it models.Itinerary
 		err := setItineraryDates(&it, "2025-06-20", "2025-06-15")
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "end_date phải bằng hoặc sau start_date")
+		assert.Contains(t, err.Error(), "end_date must be on or after start_date")
 	})
 
 	t.Run("same day", func(t *testing.T) {
@@ -123,7 +126,7 @@ func TestItineraryService_Create(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "LUXURY", it.BudgetCategory)
 		assert.Equal(t, 4, it.GuestCount)
-		assert.Equal(t, models.StringArray{"beach", "resort"}, it.Tags)
+		assert.Equal(t, pq.StringArray{"beach", "resort"}, it.Tags)
 	})
 
 	t.Run("invalid user id", func(t *testing.T) {
@@ -149,7 +152,7 @@ func TestItineraryService_Create(t *testing.T) {
 		}
 		_, err := svc.Create(user.ID.String(), input)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "start_date không hợp lệ")
+		assert.Contains(t, err.Error(), "start_date invalid")
 	})
 
 	t.Run("end_date before start_date", func(t *testing.T) {
@@ -162,7 +165,7 @@ func TestItineraryService_Create(t *testing.T) {
 		}
 		_, err := svc.Create(user.ID.String(), input)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "end_date phải bằng hoặc sau start_date")
+		assert.Contains(t, err.Error(), "end_date must be on or after start_date")
 	})
 }
 
@@ -204,10 +207,26 @@ func TestItineraryService_GetOne(t *testing.T) {
 
 	it := createTestItinerary(t, db, user.ID)
 
+	// Create a place and activity with place
+	place := models.Place{
+		ID:          uuid.New(),
+		Destination: "Da Nang",
+		Category:    "ATTRACTION",
+		Name:        "Dragon Bridge",
+	}
+	db.Create(&place)
+
+	act := createTestActivity(t, db, it.ID)
+	act.PlaceID = &place.ID
+	db.Save(&act)
+
 	t.Run("owner can access", func(t *testing.T) {
 		got, err := svc.GetOne(it.ID.String(), user.ID.String())
 		require.NoError(t, err)
 		assert.Equal(t, it.ID, got.ID)
+		require.Len(t, got.Activities, 1)
+		assert.NotNil(t, got.Activities[0].Place)
+		assert.Equal(t, "Dragon Bridge", got.Activities[0].Place.Name)
 	})
 
 	t.Run("published accessible by non-owner", func(t *testing.T) {
@@ -262,21 +281,9 @@ func TestItineraryService_Update(t *testing.T) {
 		assert.Equal(t, 10, updated.EndDate.Day())
 	})
 
-	t.Run("invalid status", func(t *testing.T) {
-		badStatus := "INVALID"
-		input := UpdateItineraryInput{Status: &badStatus}
-		_, err := svc.Update(it.ID.String(), user.ID.String(), input)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "status không hợp lệ")
-	})
-
-	t.Run("valid status - DRAFT", func(t *testing.T) {
-		status := "DRAFT"
-		input := UpdateItineraryInput{Status: &status}
-		updated, err := svc.Update(it.ID.String(), user.ID.String(), input)
-		require.NoError(t, err)
-		assert.Equal(t, "DRAFT", updated.Status)
-	})
+	// Status changes are no longer accepted by Update — they must go through
+	// PATCH /itineraries/:id/publish (Publish service method). Tests for
+	// status validity live in TestItineraryService_Publish.
 
 	t.Run("forbidden - wrong owner", func(t *testing.T) {
 		otherUser := createTestUserWith(t, db, "wrong@example.com")
@@ -284,7 +291,7 @@ func TestItineraryService_Update(t *testing.T) {
 		input := UpdateItineraryInput{Title: &newTitle}
 		_, err := svc.Update(it.ID.String(), otherUser.ID.String(), input)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "itinerary not found or forbidden")
+		assert.True(t, errors.Is(err, apperror.ErrNotFound)) // Update with wrong owner now returns ErrNotFound (404)
 	})
 }
 
@@ -309,7 +316,7 @@ func TestItineraryService_Delete(t *testing.T) {
 	t.Run("not found or forbidden", func(t *testing.T) {
 		err := svc.Delete(uuid.New().String(), user.ID.String())
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "itinerary not found or forbidden")
+		assert.True(t, errors.Is(err, apperror.ErrNotFound)) // Delete non-owned now returns ErrNotFound (404)
 	})
 }
 
@@ -323,18 +330,36 @@ func TestItineraryService_Clone(t *testing.T) {
 
 	t.Run("clone published by non-owner", func(t *testing.T) {
 		it := createTestItinerary(t, db, owner.ID)
-		_ = createTestActivity(t, db, it.ID)
+		lat := 16.061
+		lng := 108.227
+		place := models.Place{
+			ID:          uuid.New(),
+			Destination: "Đà Nẵng",
+			Category:    models.CategoryAttraction,
+			Name:        "Cầu Rồng",
+			Latitude:    &lat,
+			Longitude:   &lng,
+		}
+		require.NoError(t, db.Create(&place).Error)
+		act := createTestActivity(t, db, it.ID)
+		act.PlaceID = &place.ID
+		require.NoError(t, db.Save(&act).Error)
 		db.Model(&it).Update("status", "PUBLISHED")
 
 		clone, err := svc.Clone(it.ID.String(), requester.ID.String())
 		require.NoError(t, err)
 		assert.NotEqual(t, it.ID, clone.ID)
 		assert.Equal(t, requester.ID, clone.OwnerID)
-		assert.Contains(t, clone.Title, "(clone)")
+		assert.Contains(t, clone.Title, "Bản sao của")
 		assert.Equal(t, it.Destination, clone.Destination)
 		assert.Equal(t, "DRAFT", clone.Status)
 		assert.Equal(t, it.ID, *clone.ClonedFromID)
-		assert.Len(t, clone.Activities, 1)
+		require.Len(t, clone.Activities, 1)
+		assert.Equal(t, place.ID, *clone.Activities[0].PlaceID)
+		require.NotNil(t, clone.Activities[0].Lat)
+		require.NotNil(t, clone.Activities[0].Lng)
+		assert.Equal(t, lat, *clone.Activities[0].Lat)
+		assert.Equal(t, lng, *clone.Activities[0].Lng)
 
 		// Verify clone_count incremented on original
 		var original models.Itinerary
@@ -361,7 +386,7 @@ func TestItineraryService_Clone(t *testing.T) {
 		clone, err := svc.Clone(uuid.New().String(), owner.ID.String())
 		assert.Nil(t, clone)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "itinerary not found")
+		assert.True(t, errors.Is(err, apperror.ErrNotFound)) // Clone non-existent returns ErrNotFound (404)
 	})
 }
 
@@ -372,25 +397,44 @@ func TestItineraryService_Publish(t *testing.T) {
 	svc := NewItineraryService(db)
 	user := createTestUser(t, db)
 
-	t.Run("toggle DRAFT to PUBLISHED", func(t *testing.T) {
+	t.Run("set DRAFT to PUBLISHED", func(t *testing.T) {
 		it := createTestItinerary(t, db, user.ID)
-		result, err := svc.Publish(it.ID.String(), user.ID.String())
+		result, err := svc.Publish(it.ID.String(), user.ID.String(), "PUBLISHED")
 		require.NoError(t, err)
 		assert.Equal(t, "PUBLISHED", result.Status)
 	})
 
-	t.Run("toggle PUBLISHED to DRAFT", func(t *testing.T) {
+	t.Run("set PUBLISHED to DRAFT", func(t *testing.T) {
 		it := createTestItinerary(t, db, user.ID)
 		db.Model(&it).Update("status", "PUBLISHED")
-		result, err := svc.Publish(it.ID.String(), user.ID.String())
+		result, err := svc.Publish(it.ID.String(), user.ID.String(), "DRAFT")
 		require.NoError(t, err)
 		assert.Equal(t, "DRAFT", result.Status)
 	})
 
-	t.Run("not found or forbidden", func(t *testing.T) {
-		_, err := svc.Publish(uuid.New().String(), user.ID.String())
+	t.Run("invalid status returns error", func(t *testing.T) {
+		it := createTestItinerary(t, db, user.ID)
+		_, err := svc.Publish(it.ID.String(), user.ID.String(), "INVALID")
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "itinerary not found or forbidden")
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		_, err := svc.Publish(uuid.New().String(), user.ID.String(), "PUBLISHED")
+		assert.Error(t, err)
+	})
+
+	// Regression: Publish used to return the itinerary without preloading
+	// Activities, which caused the frontend to clear its activity list after
+	// hitting "Xuất bản". The response shape must match GetOne.
+	t.Run("response includes activities and owner", func(t *testing.T) {
+		it := createTestItinerary(t, db, user.ID)
+		_ = createTestActivity(t, db, it.ID)
+		_ = createTestActivity(t, db, it.ID)
+		result, err := svc.Publish(it.ID.String(), user.ID.String(), "PUBLISHED")
+		require.NoError(t, err)
+		assert.Equal(t, "PUBLISHED", result.Status)
+		assert.Len(t, result.Activities, 2, "Publish must preload Activities")
+		assert.Equal(t, user.ID, result.Owner.ID, "Publish must preload Owner")
 	})
 }
 

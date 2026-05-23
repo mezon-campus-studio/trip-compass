@@ -4,6 +4,7 @@ import { useDroppable } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { formatVND } from "@/lib/format";
 import type { Activity } from "../_lib/types";
 import { dayColor } from "../_lib/constants";
 import { SortableActivityCard } from "./sortable-activity-card";
@@ -37,6 +38,14 @@ export function DroppableDay({
   const dayCost  = realActivities.reduce((s, a) => s + (a.cost || 0), 0);
   const color    = dayColor(day);
 
+  // Map markers number activities-with-coords by time within the day. Mirror
+  // that ordering here so each card can show the same number as its marker.
+  const mapIndexById = new Map<string, number>();
+  [...realActivities]
+    .filter((a) => a.lat != null && a.lng != null)
+    .sort((a, b) => a.time.localeCompare(b.time))
+    .forEach((a, i) => mapIndexById.set(a.id, i + 1));
+
   return (
     <div
       ref={setNodeRef}
@@ -56,7 +65,7 @@ export function DroppableDay({
             {realActivities.length} hoạt động
           </span>
           <span className="text-[11px] font-mono font-semibold nums text-[#1a1a1a]">
-            {dayCost.toLocaleString("vi-VN")} ₫
+            {formatVND(dayCost)}
           </span>
         </div>
       </div>
@@ -69,6 +78,8 @@ export function DroppableDay({
             <SortableActivityCard
               key={activity.id}
               activity={activity}
+              mapIndex={mapIndexById.get(activity.id)}
+              dayColor={color}
               onRemove={() => onRemoveActivity(activity.id)}
               onEdit={() => onEditActivity(activity)}
               onHover={onHoverActivity}
