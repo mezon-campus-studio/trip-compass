@@ -1,0 +1,225 @@
+"""
+extractor/prose_to_plan.py — Orchestrator. Prose text → GenerateResponse.
+
+The transform mirrors `streaming/response_shape._to_generate_response` so
+the frontend sees a single shape regardless of whether the plan came from
+the legacy `create_travel_plan` tool or from the new prose extractor.
+
+Cost handling: per the v2 product decision we no longer compute exact
+budgets. The LLM's free-text already mentions rough ranges in the chat
+bubble, so `budget_recap` here is reported as zeros + `within_budget=True`
+to keep the FE schema happy without surfacing a misleading progress bar.
+
+Duplicate handling: we deliberately do NOT dedupe across days. The
+upstream LLM is now trusted as the planner, and dedupe heuristics on
+top of it caused more harm than good in the v1 pipeline.
+"""
+from __future__ import annotations
+
+from collections import Counter
+from typing import Optional
+
+from loguru import logger
+from app.extractor.prose_parser import parse_prose, ProseDay, ProseSlot
+from app.extractor.place_resolver import resolve_places
+
+
+def _canonicalise_destination(raw: str) -> str:
+    """Lower-case "đà nẵng" → "Đà Nẵng".
+
+    The agent prompt instructs `destination` args in lower-case for tool
+    calls; that form is fine for SQL ILIKE but ugly when persisted as the
+    itinerary's display destination. Python's str.title() handles Vietnamese
+    diacritics correctly ("đ".upper() == "Đ"), and the multi-word case
+    ("nha trang" → "Nha Trang") is exactly what we want.
+    """
+    return " ".join(part.capitalize() for part in raw.strip().split())
+
+
+_FOOD_SLOT_TYPES = {"breakfast", "lunch", "dinner", "snack", "brunch"}
+
+# Words that mark the agent's slot name as an actual eatery. Used to tell a real
+# food venue from an attraction that merely landed in a meal-labelled slot — the
+# agent writes "Ăn tối ... xem Cầu Rồng", so Cầu Rồng (the bridge) ends up a
+# "dinner" slot but is NOT food and must keep its pin.
+_FOOD_NAME_HINTS = ("buffet", "nhà hàng", "restaurant")
+
+
+def _slot_category(slot_type: str) -> str:
+    """Coarse mapping used by the FE card renderer."""
+    return "FOOD" if (slot_type or "").lower() in _FOOD_SLOT_TYPES else "ATTRACTION"
+
+
+def _day_type(day_num: int, total_days: int) -> str:
+    if day_num == 1:
+        return "arrival"
+    if day_num == total_days:
+        return "departure"
+    return "standard"
+
+
+def _slot_to_fe(slot: ProseSlot, resolved: Optional[dict]) -> dict:
+    """Project one parsed slot + its DB row (if matched) to the FE slot shape."""
+    # A named eatery that only matched an ATTRACTION must not borrow that
+    # attraction's pin: "Buffet Bà Nà Hills" resolves to the Bà Nà cable-car
+    # station, but the buffet is up on the summit, not at the ticket gate ~5km
+    # below → render text-only (a missing pin is more honest than a wrong one).
+    # Gated on a food keyword in the NAME so a real attraction that merely sits
+    # in a meal-labelled slot (e.g. "Cầu Rồng" in an "ăn tối" slot) keeps its pin.
+    if (
+        resolved
+        and slot.slot_type in _FOOD_SLOT_TYPES
+        and (resolved.get("category") or "").upper() != "FOOD"
+        and any(h in slot.place_name.lower() for h in _FOOD_NAME_HINTS)
+    ):
+        resolved = None
+
+    out: dict = {
+        "start": slot.start,
+        "end": slot.end,
+        "slot_type": slot.slot_type,
+        # `is_buffer=True` is the FE's signal "skip when persisting as a real
+        # activity row". For unresolved places we set it True so the user can
+        # see the card but the Save flow doesn't try to insert a stub activity
+        # pointing at a non-existent place_id.
+        "is_buffer": resolved is None,
+    }
+    if slot.note:
+        out["notes"] = slot.note
+
+    if resolved:
+        # Trust the matched place's own category (Cầu Rồng = ATTRACTION even when
+        # the agent parked it in an "ăn tối" slot; Mì Quảng = FOOD). A genuine
+        # eatery wrongly matched to an attraction was already dropped above.
+        category = resolved.get("category") or _slot_category(slot.slot_type)
+        place = {
+            "id": resolved["id"],
+            # Keep the AI's wording as the display name — it carries the
+            # user-facing intent ("Buffet Bà Nà Hills" stays distinct from the
+            # "Bà Nà Hills" attraction) and reads more naturally in Vietnamese
+            # than the DB row ("Biển Mỹ Khê" vs "My Khe Beach"). The DB row
+            # still supplies id/coords/price for the map and binding.
+            "name": slot.place_name,
+            "category": category,
+            "base_price": int(resolved.get("base_price") or 0),
+            "duration_min": 0,
+            "is_must_visit": False,
+            "is_full_day": slot.slot_type == "full_day_activity",
+            "is_free": int(resolved.get("base_price") or 0) == 0,
+        }
+        # FE SlotPlace uses lat/lng (short names) — see frontend/lib/types.ts.
+        if resolved.get("latitude") is not None:
+            place["lat"] = resolved["latitude"]
+        if resolved.get("longitude") is not None:
+            place["lng"] = resolved["longitude"]
+        if resolved.get("cover_image"):
+            place["cover_image"] = resolved["cover_image"]
+        out["place"] = place
+    else:
+        # Unresolved → render the LLM's text as a placeholder name so the
+        # card still shows something. No id → FE Save flow drops it.
+        out["place"] = {
+            "id": "",
+            "name": slot.place_name,
+            "category": _slot_category(slot.slot_type),
+            "base_price": 0,
+            "duration_min": 0,
+            "is_must_visit": False,
+            "is_full_day": slot.slot_type == "full_day_activity",
+            "is_free": True,
+        }
+    return out
+
+
+async def prose_to_plan(
+    text: str,
+    destination: Optional[str] = None,
+    tool_destination: Optional[str] = None,
+) -> Optional[dict]:
+    """Parse + resolve + assemble. Returns GenerateResponse-shaped dict, or
+    None when the prose doesn't contain a recognisable itinerary structure.
+
+    Two destination hints are accepted, applied in priority order:
+
+      1. `destination` — explicit caller override (e.g. from a future UI hint).
+      2. Mode of resolved DB rows — primary path, DB-canonical form.
+      3. `tool_destination` — destination arg captured from any tool call the
+         agent made (`get_places(destination="đà nẵng")` etc.). High-quality
+         signal that survives even when the resolver can't match any place
+         name to the DB.
+      4. Fallback "Việt Nam" — honest signal that we have no idea.
+
+    `tool_destination` is provided by the streaming layer (pump.py), which
+    snoops the agent's `on_tool_start` events. The signal is bumped to
+    title-case so persisted itineraries display "Đà Nẵng" not "đà nẵng".
+    """
+    days_parsed = parse_prose(text)
+    if not days_parsed:
+        return None
+
+    # Collect every unique place name across all days, resolve once.
+    all_names: list[str] = []
+    for day in days_parsed:
+        for slot in day.slots:
+            if slot.place_name not in all_names:
+                all_names.append(slot.place_name)
+    # Scope resolution to the known destination so a generic name like
+    # "Hải sản ven biển" can't fuzzy-match a same-keyword place in another
+    # city (e.g. "Vựa Hải Sản Bai Chay" in Hạ Long). The captured tool
+    # destination is the best pre-resolution signal we have; when neither is
+    # known we fall back to a whole-table search.
+    resolution_scope = destination or tool_destination
+    resolved = await resolve_places(all_names, destination=resolution_scope)
+
+    effective_destination = destination
+
+    if not effective_destination:
+        db_destinations = [
+            row["destination"]
+            for row in resolved.values()
+            if row and row.get("destination")
+        ]
+        if db_destinations:
+            effective_destination = Counter(db_destinations).most_common(1)[0][0]
+
+    if not effective_destination and tool_destination:
+        effective_destination = _canonicalise_destination(tool_destination)
+
+    if not effective_destination:
+        effective_destination = "Việt Nam"
+
+    total_days = len(days_parsed)
+    days_out: list[dict] = []
+    for day in days_parsed:
+        slots_out = [_slot_to_fe(slot, resolved.get(slot.place_name)) for slot in day.slots]
+        days_out.append({
+            "day_num": day.day_num,
+            "date_str": "",  # FE renders without if missing
+            "day_type": _day_type(day.day_num, total_days),
+            "primary_area": effective_destination,
+            "travel_min": 0,
+            "buffer_min": 0,
+            "slots": slots_out,
+        })
+
+    matched_count = sum(1 for v in resolved.values() if v)
+    logger.info(
+        f"[prose-extract] days={total_days} slots={sum(len(d.slots) for d in days_parsed)} "
+        f"matched={matched_count}/{len(all_names)}"
+    )
+
+    return {
+        "days": days_out,
+        # Budget recap intentionally zeroed — cost is not enforced in v2.
+        # The chat bubble already shows rough ranges in prose.
+        "budget_recap": {
+            "total_budget_vnd": 0,
+            "attraction_spent_vnd": 0,
+            "food_spent_vnd": 0,
+            "remaining_vnd": 0,
+            "within_budget": True,
+        },
+        "budget_tier": "standard",
+        "violations": [],
+        "slot_template": "standard",
+    }

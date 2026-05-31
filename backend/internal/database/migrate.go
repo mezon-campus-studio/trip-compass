@@ -410,6 +410,236 @@ END $$;`,
 				return nil
 			},
 		},
+		{
+			// Trigram + unaccent extensions for the prose-extraction pipeline
+			// (planner-ai/app/extractor/place_resolver.py uses similarity() and
+			// unaccent() to fuzzy-match LLM-mentioned place names to DB rows).
+			//
+			// Why this migration exists even though schema.sql also declares the
+			// extensions: schema.sql is only executed on a FIRST init of the
+			// postgres data dir. Existing deployments never re-run it, so
+			// without this migration a redeploy of planner-ai would crash on
+			// the first query the resolver makes.
+			//
+			// CREATE EXTENSION is idempotent.
+			//
+			// We wrap unaccent() in an IMMUTABLE SQL function because the
+			// extension-provided unaccent() is STABLE (the dictionary can be
+			// reloaded), and Postgres rejects non-IMMUTABLE functions in index
+			// expressions. The 2-arg form unaccent('unaccent', $1) pins the
+			// dictionary so IMMUTABLE is semantically valid. The index is then
+			// built on the IMMUTABLE wrapper, and the resolver query also
+			// calls it on both sides so the planner uses the index.
+			ID: "202605240015_pg_trgm_unaccent",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					`CREATE EXTENSION IF NOT EXISTS pg_trgm;`,
+					`CREATE EXTENSION IF NOT EXISTS unaccent;`,
+					// Named parameter (t) + tagged dollar-quote ($func$) instead
+					// of `$1` inside `$$...$$`. The lib/pq driver treats `$N`
+					// as a parameter placeholder even inside dollar-quoted
+					// strings, which corrupts the body when no args are bound.
+					//
+					// SET search_path inside the function so unaccent() resolves
+					// regardless of the calling session's search_path. Without
+					// this, asyncpg sessions (which default to "$user, public")
+					// can't find unaccent because the extensions live in
+					// schema_travel — function body `SELECT unaccent(t)` would
+					// raise `function unaccent(text) does not exist`.
+					`CREATE OR REPLACE FUNCTION schema_travel.f_unaccent(t text)
+						RETURNS text LANGUAGE SQL IMMUTABLE PARALLEL SAFE
+						SET search_path = schema_travel, public
+						AS $func$ SELECT unaccent(t) $func$;`,
+					`CREATE INDEX IF NOT EXISTS idx_places_name_trgm
+						ON schema_travel.places
+						USING GIN (schema_travel.f_unaccent(lower(name)) gin_trgm_ops);`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				_ = tx.Exec(`DROP INDEX IF EXISTS schema_travel.idx_places_name_trgm;`).Error
+				_ = tx.Exec(`DROP FUNCTION IF EXISTS schema_travel.f_unaccent(text);`).Error
+				// Intentionally keep the extensions — other features (full-text
+				// search, future fuzzy lookups) may depend on them.
+				return nil
+			},
+		},
+		{
+			// Hotfix for 015: the f_unaccent body resolves `unaccent` via the
+			// CALLING session's search_path, which is "$user, public" for
+			// asyncpg connections — schema_travel is missing, so the function
+			// throws `function unaccent(text) does not exist` at call time.
+			// We attach `SET search_path = schema_travel, public` to the
+			// function so it pivots search_path during its own execution
+			// regardless of the calling session. Idempotent CREATE OR REPLACE.
+			ID: "202605280016_f_unaccent_search_path",
+			Migrate: func(tx *gorm.DB) error {
+				return tx.Exec(`
+					CREATE OR REPLACE FUNCTION schema_travel.f_unaccent(t text)
+						RETURNS text LANGUAGE SQL IMMUTABLE PARALLEL SAFE
+						SET search_path = schema_travel, public
+						AS $func$ SELECT unaccent(t) $func$;
+				`).Error
+			},
+			Rollback: func(tx *gorm.DB) error {
+				// No rollback — 015's broken version isn't worth restoring.
+				return nil
+			},
+		},
+		{
+			// Data fix: scraped place data stores English-only names for some
+			// famous Đà Nẵng landmarks (e.g. "Dragon Bridge"). The prose-first
+			// planner has the LLM write Vietnamese names ("Cầu Rồng") for a
+			// Vietnamese audience, and the fuzzy place-resolver (pg_trgm) can't
+			// bridge a full translation that shares no romanized characters, so
+			// those activities save with no DB linkage (coords/price).
+			//
+			// We rename them to the "Tiếng Việt (English)" convention already
+			// present in the data ("Chợ Hàn (Han Market)"). This makes the
+			// resolver match (the Vietnamese half overlaps the LLM's output) and
+			// shows a Vietnamese-first label in the UI. Idempotent: the WHERE
+			// clause no longer matches once renamed.
+			ID: "202605290017_vi_landmark_names",
+			Migrate: func(tx *gorm.DB) error {
+				renames := map[string]string{
+					"Dragon Bridge":        "Cầu Rồng (Dragon Bridge)",
+					"The Marble Mountains": "Ngũ Hành Sơn (Marble Mountains)",
+					"Golden Bridge":        "Cầu Vàng (Golden Bridge)",
+					"Lady Buddha":          "Tượng Phật Bà Quan Âm (Lady Buddha)",
+					"Han River Bridge":     "Cầu Sông Hàn (Han River Bridge)",
+					"Love Bridge Da Nang":  "Cầu Tình Yêu (Love Bridge)",
+					"Sun Wheel":            "Vòng quay Mặt Trời (Sun Wheel)",
+				}
+				for oldName, newName := range renames {
+					if err := tx.Exec(
+						`UPDATE schema_travel.places SET name = ?
+						 WHERE name = ? AND LOWER(destination) LIKE '%nẵng%'`,
+						newName, oldName,
+					).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				reverts := map[string]string{
+					"Cầu Rồng (Dragon Bridge)":            "Dragon Bridge",
+					"Ngũ Hành Sơn (Marble Mountains)":     "The Marble Mountains",
+					"Cầu Vàng (Golden Bridge)":            "Golden Bridge",
+					"Tượng Phật Bà Quan Âm (Lady Buddha)": "Lady Buddha",
+					"Cầu Sông Hàn (Han River Bridge)":     "Han River Bridge",
+					"Cầu Tình Yêu (Love Bridge)":          "Love Bridge Da Nang",
+					"Vòng quay Mặt Trời (Sun Wheel)":      "Sun Wheel",
+				}
+				for newName, oldName := range reverts {
+					_ = tx.Exec(
+						`UPDATE schema_travel.places SET name = ? WHERE name = ?`,
+						oldName, newName,
+					).Error
+				}
+				return nil
+			},
+		},
+		{
+			// Second batch of VN landmark names — see 202605290017 for rationale.
+			// MUST be a new migration, not an edit of 017: gormigrate tracks
+			// applied migrations by ID and never re-runs one already recorded,
+			// so appending these to 017 (already deployed) would silently skip
+			// them on existing databases. Same idempotent "Tiếng Việt (English)"
+			// renames, covering Đà Nẵng landmarks that otherwise miss or
+			// mis-match in the fuzzy place-resolver.
+			ID: "202605290018_vi_landmark_names_batch2",
+			Migrate: func(tx *gorm.DB) error {
+				renames := map[string]string{
+					"Con Market":                       "Chợ Cồn (Con Market)",
+					"Da Nang Museum of Cham Sculpture": "Bảo tàng Điêu khắc Chăm (Museum of Cham Sculpture)",
+					"Da Nang Catheral":                 "Nhà thờ Con Gà (Da Nang Cathedral)",
+					"Cao Dai Temple":                   "Thánh thất Cao Đài (Cao Dai Temple)",
+					"Asia Park":                        "Công viên Châu Á (Asia Park)",
+				}
+				for oldName, newName := range renames {
+					if err := tx.Exec(
+						`UPDATE schema_travel.places SET name = ?
+						 WHERE name = ? AND LOWER(destination) LIKE '%nẵng%'`,
+						newName, oldName,
+					).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				reverts := map[string]string{
+					"Chợ Cồn (Con Market)":                               "Con Market",
+					"Bảo tàng Điêu khắc Chăm (Museum of Cham Sculpture)": "Da Nang Museum of Cham Sculpture",
+					"Nhà thờ Con Gà (Da Nang Cathedral)":                 "Da Nang Catheral",
+					"Thánh thất Cao Đài (Cao Dai Temple)":                "Cao Dai Temple",
+					"Công viên Châu Á (Asia Park)":                       "Asia Park",
+				}
+				for newName, oldName := range reverts {
+					_ = tx.Exec(
+						`UPDATE schema_travel.places SET name = ? WHERE name = ?`,
+						oldName, newName,
+					).Error
+				}
+				return nil
+			},
+		},
+		{
+			// Dedup the Bà Nà Hills cluster. TripAdvisor lists the same complex
+			// as several separate "attractions"; the generic "Ba Na Hills"
+			// (d28160695, 10 reviews, summit coords) exact-name-matched the
+			// planner's query and shadowed the real canonical "Ba Na Hills
+			// SunWorld" (d2255351, 7174 reviews) — the base cable-car/ticket
+			// station tourists actually travel to. We repoint references to the
+			// canonical, then drop the duplicate. Keyed on external_id (stable
+			// across environments), never row UUIDs. Idempotent: once deleted,
+			// the repoints and delete match nothing.
+			ID: "202605290019_dedup_ba_na_hills",
+			Migrate: func(tx *gorm.DB) error {
+				sqls := []string{
+					// Keep existing itineraries linked: repoint their activities.
+					`UPDATE schema_travel.activities a
+					    SET place_id = canon.id
+					    FROM schema_travel.places canon, schema_travel.places dup
+					    WHERE canon.external_id='2255351' AND canon.external_source='tripadvisor'
+					      AND dup.external_id='28160695'  AND dup.external_source='tripadvisor'
+					      AND a.place_id = dup.id;`,
+					// Repoint user bookmarks, but skip users who already saved the
+					// canonical (PK is user_id+place_id) — those leftover dup rows
+					// fall to the CASCADE on delete below, which is the intended
+					// dedup of a double-bookmark.
+					`UPDATE schema_travel.user_saved_places usp
+					    SET place_id = canon.id
+					    FROM schema_travel.places canon, schema_travel.places dup
+					    WHERE canon.external_id='2255351' AND canon.external_source='tripadvisor'
+					      AND dup.external_id='28160695'  AND dup.external_source='tripadvisor'
+					      AND usp.place_id = dup.id
+					      AND NOT EXISTS (
+					          SELECT 1 FROM schema_travel.user_saved_places x
+					          WHERE x.user_id = usp.user_id AND x.place_id = canon.id);`,
+					// Drop the duplicate (CASCADE clears any leftover bookmarks /
+					// place_seasons; activities were already repointed above).
+					`DELETE FROM schema_travel.places
+					    WHERE external_id='28160695' AND external_source='tripadvisor';`,
+				}
+				for _, q := range sqls {
+					if err := tx.Exec(q).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			Rollback: func(tx *gorm.DB) error {
+				// Cannot un-delete a scraped row (its UUID is gone); no-op.
+				return nil
+			},
+		},
 	})
 
 	return m.Migrate()
