@@ -2,6 +2,13 @@ CREATE SCHEMA IF NOT EXISTS "schema_travel";
 
 SET search_path TO "schema_travel";
 
+-- Extensions: pg_trgm for trigram similarity, unaccent to strip Vietnamese
+-- diacritics. Used by the prose-extraction pipeline to match LLM-mentioned
+-- place names (often spelled without diacritics, slightly truncated) to rows
+-- in places.name. CREATE EXTENSION is idempotent.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS unaccent;
+
 -- Enums
 CREATE TYPE "budget_category" AS ENUM ('BUDGET', 'MODERATE', 'LUXURY');
 
@@ -71,20 +78,58 @@ CREATE TABLE "activities" (
 CREATE TABLE "collaborators" (
     "id" UUID NOT NULL PRIMARY KEY DEFAULT gen_random_uuid (),
     "itinerary_id" UUID NOT NULL,
-    "user_id" UUID NOT NULL,
+    -- Either user_id (registered invitee) or email (pending invite for a
+    -- not-yet-registered address) must be set. The CHECK below enforces it.
+    "user_id" UUID,
+    "email" TEXT,
     "invited_by" UUID NOT NULL,
     "role" "role" NOT NULL DEFAULT 'VIEWER',
     "status" "status_collab" NOT NULL DEFAULT 'PENDING',
-    "joined_at" TIMESTAMP
+    "joined_at" TIMESTAMP,
+    CONSTRAINT collaborators_invitee_present CHECK (user_id IS NOT NULL OR email IS NOT NULL)
 );
+
+-- Block re-inviting the same email on the same itinerary (pending case only).
+CREATE UNIQUE INDEX collaborators_pending_email_uniq
+    ON "collaborators" (itinerary_id, lower(email))
+    WHERE email IS NOT NULL;
+
+-- Transactional outbox for WebSocket broadcasts. Handlers INSERT inside the
+-- same Tx as the mutation; a background worker drains the table.
+CREATE TABLE "outbox" (
+    "id"            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    "event_type"    TEXT         NOT NULL,
+    "room_id"       TEXT         NOT NULL,
+    "payload"       JSONB        NOT NULL,
+    "created_at"    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    "dispatched_at" TIMESTAMPTZ,
+    "retry_count"   INT          NOT NULL DEFAULT 0,
+    "last_error"    TEXT
+);
+
+CREATE INDEX outbox_pending_idx
+    ON "outbox" (created_at)
+    WHERE dispatched_at IS NULL;
 
 CREATE TABLE "ai_chat_messages" (
     "id" UUID NOT NULL PRIMARY KEY DEFAULT gen_random_uuid (),
-    "itinerary_id" UUID NOT NULL,
+    "session_id" UUID,
+    "itinerary_id" UUID,
     "role" "role_ai_chat_message" NOT NULL,
     "content" TEXT NOT NULL,
     "metadata" JSONB,
     "created_at" TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE "ai_chat_sessions" (
+    "id" UUID NOT NULL PRIMARY KEY DEFAULT gen_random_uuid (),
+    "user_id" UUID NOT NULL,
+    "title" TEXT NOT NULL,
+    "destination" TEXT,
+    "message_count" INTEGER NOT NULL DEFAULT 0,
+    "saved_itinerary_id" UUID,
+    "created_at" TIMESTAMP NOT NULL DEFAULT NOW(),
+    "updated_at" TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE "places" (
@@ -200,8 +245,29 @@ ADD CONSTRAINT "fk_collaborators_invited_by" FOREIGN KEY ("invited_by") REFERENC
 ALTER TABLE "ai_chat_messages"
 ADD CONSTRAINT "fk_chat_itinerary" FOREIGN KEY ("itinerary_id") REFERENCES "itineraries" ("id") ON DELETE CASCADE;
 
+ALTER TABLE "ai_chat_sessions"
+ADD CONSTRAINT "fk_ai_chat_sessions_user" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE;
+
+ALTER TABLE "ai_chat_sessions"
+ADD CONSTRAINT "fk_ai_chat_sessions_saved_itinerary" FOREIGN KEY ("saved_itinerary_id") REFERENCES "itineraries" ("id") ON DELETE SET NULL;
+
+ALTER TABLE "ai_chat_messages"
+ADD CONSTRAINT "fk_chat_session" FOREIGN KEY ("session_id") REFERENCES "ai_chat_sessions" ("id") ON DELETE CASCADE;
+
 ALTER TABLE "user_saved_places"
 ADD CONSTRAINT "fk_saved_user" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE;
 
 ALTER TABLE "user_saved_places"
 ADD CONSTRAINT "fk_saved_place" FOREIGN KEY ("place_id") REFERENCES "places" ("id") ON DELETE CASCADE;
+
+-- Trigram index for fuzzy place-name lookup (prose-extraction pipeline).
+-- See backend gormigrate 202605240015 for the canonical version — this
+-- schema.sql copy only runs on first-init of a fresh postgres data dir;
+-- existing deployments get the same shape via the Go migration.
+CREATE OR REPLACE FUNCTION "f_unaccent"(t text)
+    RETURNS text LANGUAGE SQL IMMUTABLE PARALLEL SAFE
+    SET search_path = schema_travel, public
+    AS $func$ SELECT unaccent(t) $func$;
+
+CREATE INDEX IF NOT EXISTS idx_places_name_trgm
+    ON "places" USING GIN (f_unaccent(lower("name")) gin_trgm_ops);

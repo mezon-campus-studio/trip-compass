@@ -87,16 +87,22 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
     toast.success("Đã sao chép link chia sẻ")
   }
 
-  const handlePublish = async () => {
+  // Toggle DRAFT ↔ PUBLISHED. Backend accepts both via PATCH /publish so
+  // a single handler covers both directions.
+  const handleTogglePublish = async () => {
+    if (!itinerary) return
+    const next = itinerary.status === "PUBLISHED" ? "DRAFT" : "PUBLISHED"
     try {
       const updated = await apiFetch<Itinerary>(`/itineraries/${id}/publish`, {
         method: "PATCH",
-        body: { status: "PUBLISHED" },
+        body: { status: next },
       })
       setItinerary(updated)
-      toast.success("Đã xuất bản lịch trình!")
+      toast.success(
+        next === "PUBLISHED" ? "Đã xuất bản lịch trình" : "Đã chuyển về bản nháp"
+      )
     } catch {
-      toast.error("Xuất bản thất bại")
+      toast.error(next === "PUBLISHED" ? "Xuất bản thất bại" : "Chuyển về nháp thất bại")
     }
   }
 
@@ -199,10 +205,20 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
                 <Button variant="outline" onClick={handleClone} className="h-10 px-3 border-[#e8e2d9] bg-transparent text-[#1a1a1a]">
                   <Copy className="w-4 h-4 mr-2" />Nhân bản
                 </Button>
-                {isOwner && itinerary.status === "DRAFT" && (
-                  <Button onClick={handlePublish} className="h-10 bg-[#3d5a3d] hover:bg-[#2d4a2d] text-white">
-                    Xuất bản
-                  </Button>
+                {isOwner && (
+                  itinerary.status === "DRAFT" ? (
+                    <Button onClick={handleTogglePublish} className="h-10 bg-[#3d5a3d] hover:bg-[#2d4a2d] text-white">
+                      Xuất bản
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      onClick={handleTogglePublish}
+                      className="h-10 px-3 border-[#e8e2d9] bg-transparent text-[#1a1a1a]"
+                    >
+                      Bỏ xuất bản
+                    </Button>
+                  )
                 )}
                 {isOwner && (
                   <Button asChild className="h-10 bg-[#1a1a1a] hover:bg-[#3d5a3d] text-white">
@@ -309,7 +325,7 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
                             {String(index + 1).padStart(2, "0")}
                           </div>
                           <div className="mt-2 text-lg font-semibold tabular-nums leading-none">
-                            {activity.start_time ?? "--:--"}
+                            {(activity.start_time ?? "--:--").slice(0, 5)}
                           </div>
                         </div>
                         <div className="inline-flex items-center gap-1.5 text-[10px] tracking-[0.15em] uppercase text-[#d4a853] font-medium">
@@ -334,7 +350,7 @@ export default function ItineraryDetailPage({ params }: { params: Promise<{ id: 
                           {activity.start_time && activity.end_time && (
                             <span className="inline-flex items-center gap-1.5 text-[#6b6b6b]">
                               <Clock className="w-3.5 h-3.5 text-[#c4785a]" />
-                              {activity.start_time} – {activity.end_time}
+                              {activity.start_time.slice(0, 5)} – {activity.end_time.slice(0, 5)}
                             </span>
                           )}
                           {activity.estimated_cost > 0 && (

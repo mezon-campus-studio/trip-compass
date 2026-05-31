@@ -28,6 +28,7 @@ from app.streaming.think_stripper import _ThinkStripper, _strip_thinking
 from app.streaming.json_stripper import _JsonStripper
 from app.streaming.response_shape import _to_generate_response, _extract_plan
 from app.streaming.summary import _strip_json_objects, _deterministic_summary
+from app.extractor import prose_to_plan
 
 
 async def stream_chat_response(
@@ -50,6 +51,11 @@ async def stream_chat_response(
     plan_data: dict | None = None
     full_text = ""
     stream_dropped = False  # True if upstream LLM closed the connection mid-stream
+    # Captured from on_tool_start events. The agent's first tool call usually
+    # carries the user's destination intent (e.g. get_places(destination=
+    # "đà nẵng")) — we keep this as a signal for the prose extractor when
+    # the resolver can't match any place name to the DB.
+    captured_tool_destination: str | None = None
     think_stripper = _ThinkStripper()
     json_stripper = _JsonStripper()
 
@@ -109,6 +115,22 @@ async def stream_chat_response(
             if kind == "on_tool_start":
                 tool_name = event.get("name", "")
                 tools_used.append(tool_name)
+
+                # Snoop `destination` from the tool's input args. The first
+                # such hit wins (subsequent calls usually echo the same
+                # destination; we don't bother overriding). Catches the case
+                # where the resolver finds zero DB matches but the agent
+                # already classified the trip's destination via a tool call.
+                if captured_tool_destination is None:
+                    tool_input = data.get("input")
+                    if isinstance(tool_input, dict):
+                        candidate = tool_input.get("destination")
+                        if isinstance(candidate, str) and candidate.strip():
+                            captured_tool_destination = candidate.strip()
+                            logger.info(
+                                f"[stream] captured destination={candidate.strip()!r} "
+                                f"from {tool_name}"
+                            )
 
                 labels = {
                     "get_places":      "🔍 Đang tìm địa điểm...",
@@ -234,6 +256,39 @@ async def stream_chat_response(
             logger.info("[stream-extract] outcome=full_text_fallback ok=true")
         else:
             logger.error("[stream-extract] outcome=missed ok=false — plan lost despite create_travel_plan firing")
+
+    # ── NEW: Prose extraction (v2 primary path) ────────────────────────────
+    # When the agent did NOT call create_travel_plan but the response contains
+    # day markers, treat it as a prose-format itinerary and project it into
+    # the same GenerateResponse shape the FE consumes. This is the design
+    # change that escapes the "JSON tax" Gemma struggles with: the model
+    # reasons in natural Vietnamese, we structure it after the fact.
+    #
+    # Destination is left as None so the fuzzy resolver searches the whole
+    # places table — slightly less precise than a destination-filtered query
+    # but avoids fragile NER on the prose. If precision becomes an issue,
+    # extract it from the day-1 title or from chat session context.
+    if not plan_data and "create_travel_plan" not in tools_used:
+        # The think-stripper has already cleaned reasoning tags but
+        # full_text at this point still includes the day/slot bullets.
+        prose_text = _strip_thinking(full_text)
+        try:
+            plan_data = await prose_to_plan(
+                prose_text,
+                destination=None,
+                tool_destination=captured_tool_destination,
+            )
+            if plan_data:
+                logger.info(
+                    f"[prose-extract] outcome=ok days={len(plan_data.get('days', []))} "
+                    f"dest={plan_data.get('days', [{}])[0].get('primary_area', '')!r}"
+                )
+            else:
+                logger.debug("[prose-extract] no day markers found — skipping")
+        except Exception as exc:
+            # Never let extractor failures break the chat response. Worst
+            # case the user sees the prose without a card.
+            logger.warning(f"[prose-extract] failed: {type(exc).__name__}: {exc}")
 
     # Emit anything still buffered by the think-stripper (post-</think> tail).
     trailing = think_stripper.flush()
